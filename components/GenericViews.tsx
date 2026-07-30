@@ -51,12 +51,35 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
   const [showFabMenu, setShowFabMenu] = useState(false);
   const [isEditingNews, setIsEditingNews] = useState(false);
   const [isEditingProgramming, setIsEditingProgramming] = useState(false);
+  const [isEditingHistory, setIsEditingHistory] = useState(false);
+  const [historyText, setHistoryText] = useState(customContent || '');
   const [editForm, setEditForm] = useState<NewsItem | null>(null);
   const [editedProgramming, setEditedProgramming] = useState<ProgramSchedule[] | null>(null);
+  const [syncCount, setSyncCount] = useState(0);
   
   const isProgramming = title.includes('Programación');
+  const isHistory = title.includes('Historia') || title.includes('Quiénes Somos');
   // Logic to show FAB on specific public views (History, About, Programming)
-  const showListenerFab = title.includes('Historia') || title.includes('Quiénes Somos') || title.includes('Programación');
+  const showListenerFab = isHistory || isProgramming;
+
+  // Listen for real-time station data sync events
+  useEffect(() => {
+    const handleSync = (e: any) => {
+      const { key, data } = e.detail || {};
+      if (key === 'rcm_data_history' && typeof data === 'string') {
+        setHistoryText(data);
+      }
+      setSyncCount(prev => prev + 1);
+    };
+    window.addEventListener('cmnl_db_sync', handleSync);
+    return () => window.removeEventListener('cmnl_db_sync', handleSync);
+  }, []);
+
+  useEffect(() => {
+    if (customContent !== undefined) {
+      setHistoryText(customContent);
+    }
+  }, [customContent]);
 
   const handleEditNewsClick = () => {
     if (newsItem) {
@@ -69,6 +92,71 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
     if (editForm && onNewsUpdate) {
       onNewsUpdate(editForm);
       setIsEditingNews(false);
+
+      // Persist & sync news edit
+      const savedNews = localStorage.getItem('rcm_data_news');
+      let newsList = savedNews ? JSON.parse(savedNews) : [];
+      newsList = newsList.map((n: any) => n.id === editForm.id ? editForm : n);
+      localStorage.setItem('rcm_data_news', JSON.stringify(newsList));
+      fetch('/api/save-actualcmnl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ news: newsList, updatedAt: new Date().toISOString() })
+      }).catch(e => console.error(e));
+    }
+  };
+
+  const handleSaveHistoryEdit = () => {
+    localStorage.setItem('rcm_data_history', historyText);
+    setIsEditingHistory(false);
+    
+    // Save to server
+    fetch('/api/save-actualcmnl', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ history: historyText, updatedAt: new Date().toISOString() })
+    }).catch(e => console.error(e));
+
+    alert('Historia guardada y sincronizada correctamente.');
+  };
+
+  const handleProgrammingUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (file) {
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const text = (event.target?.result as string) || '';
+        try {
+          let parsed: ProgramSchedule[] = [];
+          if (text.trim().startsWith('[') || text.trim().startsWith('{')) {
+            parsed = JSON.parse(text);
+          } else {
+            // Text format parser for schedule
+            const lines = text.split('\n').filter(l => l.trim());
+            parsed = lines.map((line, idx) => {
+              const parts = line.split(/[-|]/);
+              const name = parts[0]?.trim() || `Programa ${idx + 1}`;
+              const start = parts[1]?.trim() || '00:00';
+              const end = parts[2]?.trim() || '00:00';
+              return { name, start, end, days: [1, 2, 3, 4, 5] };
+            });
+          }
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            localStorage.setItem('rcm_manual_programming', JSON.stringify(parsed));
+            fetch('/api/save-actualcmnl', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ manualProgramming: parsed, updatedAt: new Date().toISOString() })
+            }).catch(e => console.error(e));
+            alert(`¡${parsed.length} programas cargados y sincronizados correctamente!`);
+          } else {
+            alert('El archivo no contiene un formato de programación válido.');
+          }
+        } catch (err) {
+          alert('Error al procesar el archivo de programación.');
+        }
+      };
+      reader.readAsText(file);
     }
   };
 
@@ -123,7 +211,6 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
     };
 
     allPrograms.sort((a, b) => {
-        // Special case: Cómplices first on Sunday
         if (a.name.toLowerCase().includes('cómplices') && a.days.includes(0) && b.days.includes(0)) return -1;
         if (b.name.toLowerCase().includes('cómplices') && b.days.includes(0) && a.days.includes(0)) return 1;
         return getMinutes(a.start) - getMinutes(b.start);
@@ -134,7 +221,7 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
     const sunday = allPrograms.filter(p => p.days.includes(0));
 
     return { monFri, saturday, sunday, all: allPrograms };
-  }, [isProgramming, isEditingProgramming]); // Re-run when isEditingProgramming changes (after save)
+  }, [isProgramming, isEditingProgramming, syncCount]);
 
   const handleStartEdit = () => {
       setEditedProgramming(programmingData?.all || []);
@@ -145,6 +232,14 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
       if (editedProgramming) {
           localStorage.setItem('rcm_manual_programming', JSON.stringify(editedProgramming));
           setIsEditingProgramming(false);
+
+          fetch('/api/save-actualcmnl', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ manualProgramming: editedProgramming, updatedAt: new Date().toISOString() })
+          }).catch(e => console.error(e));
+
+          alert('Programación guardada y sincronizada correctamente.');
       }
   };
 
@@ -257,16 +352,30 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
             </div>
         </div>
         
-        <div className="flex gap-2">
+        <div className="flex gap-2 items-center">
             {onUpload && (
-                <label className="flex items-center gap-2 bg-[#C69C6D] hover:bg-[#b58b5c] text-white px-4 py-2 rounded-lg text-xs font-bold transition-colors cursor-pointer">
+                <label className="flex items-center gap-2 bg-[#C69C6D] hover:bg-[#b58b5c] text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer">
                     <Upload size={16} />
-                    <span>Cargar (.txt)</span>
+                    <span>Cargar Historia (.txt)</span>
                     <input type="file" accept=".txt" onChange={(e) => onUpload(e, 'history')} className="hidden" />
                 </label>
             )}
-            {isProgramming && user?.role === 'admin' && (
+            {isHistory && (user?.role === 'admin' || user?.role === 'worker') && (
+                <button 
+                  onClick={() => setIsEditingHistory(true)} 
+                  className="flex items-center gap-2 bg-[#C69C6D] hover:bg-[#b58b5c] text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer"
+                >
+                  <Edit2 size={16} />
+                  <span>Editar Historia</span>
+                </button>
+            )}
+            {isProgramming && (user?.role === 'admin' || user?.role === 'worker') && (
                 <>
+                    <label className="flex items-center gap-2 bg-[#C69C6D] hover:bg-[#b58b5c] text-white px-3 py-1.5 rounded-lg text-xs font-bold transition-colors cursor-pointer">
+                        <Upload size={16} />
+                        <span>Cargar Programación</span>
+                        <input type="file" accept=".txt,.json" onChange={handleProgrammingUpload} className="hidden" />
+                    </label>
                     {isEditingProgramming ? (
                         <>
                             <button onClick={handleSaveEdit} className="p-2 bg-green-600 hover:bg-green-700 rounded-lg transition-colors flex items-center gap-2 text-xs font-bold">
@@ -432,9 +541,9 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
              </div>
           </div>
         )
-      ) : customContent ? (
+      ) : (historyText || customContent) ? (
             <div className="max-w-2xl mx-auto bg-white p-6 rounded-xl shadow-sm border border-[#5D3A24]/10 whitespace-pre-wrap">
-                {customContent}
+                {historyText || customContent}
             </div>
         ) : (
           <div className="flex flex-col items-center justify-center h-full opacity-50">
@@ -444,6 +553,29 @@ export const PlaceholderView: React.FC<ViewProps> = ({ title, subtitle, onBack, 
           </div>
         )}
       </div>
+
+      {/* History Edit Modal */}
+      {isEditingHistory && (
+          <div className="fixed inset-0 z-50 bg-black/80 flex items-center justify-center p-4">
+              <div className="bg-[#2C1B15] border border-[#9E7649]/30 p-6 rounded-xl w-full max-w-2xl text-[#E8DCCF]">
+                  <h2 className="text-lg font-bold mb-4">Editar Contenido de Historia</h2>
+                  <textarea 
+                    className="w-full p-3 mb-4 bg-[#1A100C] border border-[#9E7649]/30 rounded-xl h-64 text-sm focus:outline-none focus:border-[#C69C6D]" 
+                    value={historyText} 
+                    onChange={e => setHistoryText(e.target.value)} 
+                    placeholder="Escriba aquí el contenido de la historia..." 
+                  />
+                  <div className="flex justify-end gap-2">
+                      <button onClick={() => setIsEditingHistory(false)} className="px-4 py-2 bg-black/40 hover:bg-black/60 rounded-lg text-xs font-bold">
+                        Cancelar
+                      </button>
+                      <button onClick={handleSaveHistoryEdit} className="px-4 py-2 bg-[#C69C6D] hover:bg-[#b58b5c] text-white rounded-lg text-xs font-bold flex items-center gap-2">
+                        <Save size={16} /> Guardar e Iniciar Sincronización
+                      </button>
+                  </div>
+              </div>
+          </div>
+      )}
 
       {/* Floating WhatsApp Menu for Listener Views */}
       {showListenerFab && (

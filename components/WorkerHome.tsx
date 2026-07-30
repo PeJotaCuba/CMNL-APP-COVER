@@ -83,34 +83,68 @@ const WorkerHome: React.FC<Props> = ({
     if (file && setNews) {
       const reader = new FileReader();
       reader.onload = (event) => {
-        const text = event.target?.result as string;
+        const text = (event.target?.result as string) || '';
         const lines = text.split('\n');
-        const date = lines[0].trim();
-        const content = lines.slice(1).join('\n');
-        const blocks = content.split(/Titular:/i).filter(b => b.trim());
+        let date = new Date().toLocaleDateString('es-ES');
+        let bodyText = text;
+
+        if (lines[0] && (lines[0].includes('/') || lines[0].includes('-') || lines[0].toLowerCase().includes('fecha') || /^\d{1,4}/.test(lines[0].trim()))) {
+          date = lines[0].replace(/fecha:/i, '').trim();
+          bodyText = lines.slice(1).join('\n');
+        }
+
+        let blocks = bodyText.split(/Titular:|Noticia:/i).filter(b => b.trim());
+        if (blocks.length === 0 || (blocks.length === 1 && !bodyText.match(/Titular:|Noticia:/i))) {
+          const rawParagraphs = bodyText.split(/\n\s*\n/).filter(p => p.trim());
+          if (rawParagraphs.length > 1) {
+            blocks = rawParagraphs;
+          } else {
+            blocks = [bodyText];
+          }
+        }
 
         const newNews: NewsItem[] = blocks.map((block, index) => {
           const fuenteMatch = block.match(/Fuente:\s*([\s\S]*?)(?=\n\n|\nTexto|Texto|$)/i);
           const textoMatch = block.match(/Texto:\s*([\s\S]*?)$/i);
-          
-          const titleMatch = block.trim().match(/^([\s\S]*?)(?=\n\n|\nFuente|Fuente|$)/i);
-          const title = titleMatch ? titleMatch[1].trim() : 'Sin Título';
+          const titleMatch = block.trim().match(/^([\s\S]*?)(?=\n\n|\nFuente|Fuente|\nTexto|Texto|$)/i);
+
+          let title = titleMatch ? titleMatch[1].trim().replace(/^Titular:\s*/i, '') : 'Noticia';
+          if (title.length > 120) title = title.substring(0, 117) + '...';
           const author = fuenteMatch ? fuenteMatch[1].trim() : 'Redacción RCM';
-          const content = textoMatch ? textoMatch[1].trim() : '';
-          
+          let content = textoMatch ? textoMatch[1].trim() : block.trim();
+
+          if (content.startsWith(titleMatch ? titleMatch[1] : '')) {
+            content = content.replace(titleMatch ? titleMatch[1] : '', '').trim();
+          }
+          content = content.replace(/^(Fuente|Texto):\s*/gm, '').trim() || title;
+
+          const excerpt = content.split('. ')[0] + '.';
+
           return {
             id: `news-${Date.now()}-${index}`,
-            title,
-            author,
-            content,
+            title: title || 'Noticia RCM',
+            author: author || 'Redacción RCM',
+            content: content,
             category: 'General',
             date: date,
-            excerpt: content.split('. ')[0] + '.'
+            excerpt: excerpt
           };
         });
-        setNews(newNews);
-        localStorage.setItem('rcm_data_news', JSON.stringify(newNews));
-        alert('Noticias cargadas satisfactoriamente.');
+
+        if (newNews.length > 0) {
+          setNews(newNews);
+          localStorage.setItem('rcm_data_news', JSON.stringify(newNews));
+          
+          fetch('/api/save-actualcmnl', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ news: newNews, updatedAt: new Date().toISOString() })
+          }).catch(err => console.error("Error saving actualcmnl:", err));
+
+          alert(`¡${newNews.length} noticias cargadas y sincronizadas con éxito para todos los usuarios!`);
+        } else {
+          alert('No se pudieron extraer noticias del archivo seleccionado.');
+        }
       };
       reader.readAsText(file);
     }

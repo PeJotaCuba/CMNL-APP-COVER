@@ -650,28 +650,35 @@ async function startServer() {
 
   app.use(express.json({ limit: "15mb" }));
 
-  // Create Convex proxy middleware to handle both HTTP and WebSocket connections
-  const convexTarget = process.env.VITE_CONVEX_URL || process.env.CONVEX_URL || "http://127.0.0.1:3210";
-  const convexProxy: any = createProxyMiddleware({
-    target: convexTarget,
-    changeOrigin: true,
-    ws: true,
-    pathRewrite: {
-      "^/api/convex": "",
-    },
-    on: {
-      error: (err: any, _req: any, res: any) => {
-        if (res && typeof res.status === "function" && !res.headersSent) {
-          res.status(503).json({ error: "Convex backend service unavailable", message: err.message });
-        }
-      },
-    },
-    logger: console,
-  });
+  // Create Convex proxy middleware if Convex target URL is configured
+  const convexTarget = process.env.VITE_CONVEX_URL || process.env.CONVEX_URL;
+  let convexProxy: any = null;
 
-  // Mount the proxy middleware for Convex API paths
-  app.use("/api/convex", convexProxy);
-  app.use("/api/:version/sync", convexProxy);
+  if (convexTarget) {
+    convexProxy = createProxyMiddleware({
+      target: convexTarget,
+      changeOrigin: true,
+      ws: true,
+      pathRewrite: {
+        "^/api/convex": "",
+      },
+      on: {
+        error: (err: any, _req: any, res: any) => {
+          if (res && typeof res.status === "function" && !res.headersSent) {
+            res.status(503).json({ error: "Convex backend service unavailable", message: err.message });
+          }
+        },
+      },
+      logger: console,
+    });
+
+    app.use("/api/convex", convexProxy);
+    app.use("/api/:version/sync", convexProxy);
+  } else {
+    app.use(["/api/convex", "/api/:version/sync"], (_req, res) => {
+      res.status(503).json({ error: "Convex backend service not configured" });
+    });
+  }
 
   // API routes FIRST
   app.get("/api/health", (req, res) => {
@@ -890,7 +897,7 @@ async function startServer() {
 
   // Handle WebSocket upgrades for Convex subscriptions
   server.on("upgrade", (req: any, socket: any, head: any) => {
-    if (req.url && (req.url.startsWith("/api/convex") || req.url.includes("/sync"))) {
+    if (convexProxy && req.url && (req.url.startsWith("/api/convex") || req.url.includes("/sync"))) {
       convexProxy.upgrade(req, socket, head);
     }
   });

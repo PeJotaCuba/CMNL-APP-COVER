@@ -294,9 +294,15 @@ const AppContent: React.FC = () => {
     });
   };
 
-  // Intercept all manual localStorage.setItem calls and sync to Convex in real-time
+  // Intercept all manual localStorage.setItem calls and sync to Convex & BroadcastChannel in real-time
   useEffect(() => {
     const originalSetItem = localStorage.setItem;
+    let syncChannel: BroadcastChannel | null = null;
+    try {
+      syncChannel = new BroadcastChannel('cmnl_sync_channel');
+    } catch (e) {
+      console.warn("BroadcastChannel not supported in this environment");
+    }
     
     localStorage.setItem = function(key, value) {
       originalSetItem.apply(this, [key, value]);
@@ -313,7 +319,7 @@ const AppContent: React.FC = () => {
         'rcm_transmission_historical', 'rcm_payment_config', 'rcm_payment_workers',
         'rcm_payment_programs', 'rcm_payment_roles', 'rcm_payment_history',
         'rcm_scripts_programs', 'rcm_scripts_history', 'rcm_program_sections',
-        'music_productions', 'music_tracks'
+        'music_productions', 'music_tracks', 'rcm_parrilla_modifications', 'rcm_fichas_hash'
       ];
       
       if (syncKeys.some(sk => key === sk || key.startsWith('user_') || key.startsWith('guionbd_data_') || key.startsWith('program_sections_'))) {
@@ -322,6 +328,17 @@ const AppContent: React.FC = () => {
         
         const cleanVal = sanitizeKeys(parsedVal);
         
+        // Broadcast locally
+        if (syncChannel) {
+          try {
+            syncChannel.postMessage({ key, data: parsedVal });
+          } catch(e) {}
+        }
+
+        // Fire local event
+        window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data: parsedVal } }));
+
+        // Sync to Convex
         updateStationDataMutation({
           key: key,
           data: cleanVal,
@@ -331,9 +348,29 @@ const AppContent: React.FC = () => {
         });
       }
     };
+
+    // Listen to BroadcastChannel for cross-tab updates
+    if (syncChannel) {
+      syncChannel.onmessage = (event) => {
+        const { key, data } = event.data || {};
+        if (key === 'rcm_data_news') {
+          setNews(data);
+        } else if (key === 'rcm_data_history') {
+          setHistoryContent(data);
+        } else if (key === 'rcm_data_about') {
+          setAboutContent(data);
+        } else if (key === 'rcm_data_users') {
+          setUsers(data);
+        } else if (key === 'rcm_equipo_cmnl') {
+          setEquipoData(data);
+        }
+        window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data } }));
+      };
+    }
     
     return () => {
       localStorage.setItem = originalSetItem;
+      if (syncChannel) syncChannel.close();
     };
   }, [updateStationDataMutation]);
 

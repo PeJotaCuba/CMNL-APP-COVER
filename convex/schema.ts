@@ -48,4 +48,32 @@ export default defineSchema({
     .index("by_status", ["status"])
     .index("by_sender", ["sender"])
     .index("by_document_type", ["documentType"]),
+
+  // Dedicated table for station news
+  news: defineTable({
+    newsId: v.string(),
+    title: v.string(),
+    author: v.optional(v.string()),
+    content: v.string(),
+    excerpt: v.optional(v.string()),
+    category: v.optional(v.string()),
+    date: v.optional(v.string()),
+    updatedAt: v.string(),
+  }).index("by_news_id", ["newsId"]),
+
+  // Dedicated table for station history and about content
+  history: defineTable({
+    key: v.string(), // e.g. 'history', 'about'
+    content: v.string(),
+    updatedAt: v.string(),
+    updatedBy: v.optional(v.string()),
+  }).index("by_key", ["key"]),
+
+  // Dedicated table for programming schedules and modifications
+  programming: defineTable({
+    key: v.string(), // e.g. 'manual_programming', 'programs', 'modifications'
+    data: v.any(),
+    updatedAt: v.string(),
+    updatedBy: v.optional(v.string()),
+  }).index("by_key", ["key"]),
 });
