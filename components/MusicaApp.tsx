@@ -1,0 +1,1895 @@
+import React, { useState, useEffect } from 'react';
+import CMNLHeader from './CMNLHeader';
+import { User as GlobalUser } from '../types';
+import { Track, ViewState, AuthMode, User, DEFAULT_PROGRAMS_LIST, Report, ExportItem, SavedSelection } from './musica/types';
+import { sortAndStandardizePrograms, getActiveProgramsFromStorage } from './musica/programUtils';
+import { parseTxtDatabase, GENRES_LIST, COUNTRIES_LIST } from './musica/constants';
+import TrackList from './musica/TrackList';
+import TrackDetail from './musica/TrackDetail';
+import CreditResults from './musica/CreditResults';
+import Settings from './musica/Settings';
+import Productions from './musica/Productions';
+import ReportsViewer from './musica/ReportsViewer';
+import Guide from './musica/Guide';
+import { loadTracksFromDB, saveTracksToDB, saveReportToDB, loadReportsFromDB, loadProductionsFromDB, saveProductionToDB, saveSelectionsToDB, loadSelectionsFromDB, saveSavedSelectionsListToDB, loadSavedSelectionsListFromDB } from './musica/services/db'; 
+import { generateReportPDF } from './musica/services/pdfService';
+import { openWhatsApp } from '../utils/whatsappUtils';
+import { useQuery, useMutation } from 'convex/react';
+import { api } from '../convex/_generated/api';
+import { sanitizeKeys, desanitizeKeys } from '../utils/convexSanitizer';
+
+const USERS_KEY = 'rcm_users_db';
+const PROGRAMS_KEY = 'rcm_programs_list';
+const getSelectionKey = () => `user_${localStorage.getItem('rcm_user_username') || 'default'}_rcm_current_selection`;
+const getSavedSelectionsKey = () => `user_${localStorage.getItem('rcm_user_username') || 'default'}_rcm_saved_selections`;
+const CUSTOM_ROOTS_KEY = 'rcm_custom_roots';
+
+const USERS_DB_URL = 'https://raw.githubusercontent.com/PeJotaCuba/RCM-M-sica/refs/heads/main/musuarios.json';
+
+const ROOT_DB_CONFIG: Record<string, { url: string, filename: string }> = {
+    'Música 1': { url: 'https://raw.githubusercontent.com/PeJotaCuba/Bases-de-datos-CMNL/refs/heads/almacen/mdatos1.json', filename: 'mdatos1.json' },
+    'Música 2': { url: 'https://raw.githubusercontent.com/PeJotaCuba/Bases-de-datos-CMNL/refs/heads/almacen/mdatos2.json', filename: 'mdatos2.json' },
+    'Música 3': { url: 'https://raw.githubusercontent.com/PeJotaCuba/Bases-de-datos-CMNL/refs/heads/almacen/mdatos3.json', filename: 'mdatos3.json' },
+    'Música 4': { url: 'https://raw.githubusercontent.com/PeJotaCuba/Bases-de-datos-CMNL/refs/heads/almacen/mdatos4.json', filename: 'mdatos4.json' },
+    'Música 5': { url: 'https://raw.githubusercontent.com/PeJotaCuba/Bases-de-datos-CMNL/refs/heads/almacen/mdatos5.json', filename: 'mdatos5.json' },
+    'Otros':    { url: 'https://raw.githubusercontent.com/PeJotaCuba/RCM-M-sica/refs/heads/main/motros.json', filename: 'motros.json' }
+};
+
+interface MusicaAppProps {
+  currentUser: GlobalUser | null;
+  onBack: () => void;
+  onMenuClick: () => void;
+  onDirtyChange: (dirty: boolean) => void;
+  onSaveCMNL?: () => void;
+}
+
+
+// ...
+const MusicaApp: React.FC<MusicaAppProps> = ({ currentUser: globalUser, onBack, onMenuClick, onDirtyChange, onSaveCMNL }) => {
+  const allConvexStationData = useQuery(api.stationData.getAllStationData);
+  const updateStationDataMutation = useMutation(api.stationData.updateStationData);
+  const generateUploadUrl = useMutation(api.documents.generateUploadUrl);
+
+  const [tracks, setTracks] = useState<Track[]>([]);
+  const [view, setView] = useState<ViewState>(ViewState.LIST);
+  const [users, setUsers] = useState<User[]>([]);
+
+  const [isLoaded, setIsLoaded] = useState(false);
+  const isInitialMount = React.useRef(true);
+
+  useEffect(() => {
+      isInitialMount.current = false;
+  }, []);
+
+  // Reactively synchronize tracks and productions from Convex
+  useEffect(() => {
+    if (!allConvexStationData) return;
+    
+    // Sync shared tracks from administrator
+    const remoteTracksItem = allConvexStationData.find(item => item.key === 'music_tracks');
+    if (remoteTracksItem && remoteTracksItem.data) {
+        const remoteData = desanitizeKeys(remoteTracksItem.data);
+        
+        const processTracks = (newTracks: Track[]) => {
+            if (Array.isArray(newTracks) && newTracks.length > 0) {
+                const stringifiedRemote = JSON.stringify(newTracks);
+                const stringifiedLocal = JSON.stringify(tracks);
+                if (stringifiedRemote !== stringifiedLocal) {
+                    saveTracksToDB(newTracks).then(() => {
+                        setTracks(newTracks);
+                    }).catch(err => {
+                        console.error("Failed to sync remote tracks:", err);
+                    });
+                }
+            }
+        };
+
+        if (Array.isArray(remoteData)) {
+            // Old format: direct array
+            processTracks(remoteData);
+        } else if (remoteData && typeof remoteData === 'object' && remoteData.storageId) {
+            // New format: Convex Storage
+            // We can use the URL if it's provided or we can fetch it if we had a query for it.
+            // Since we don't want to add another query here, we hope the URL is in the data or we use a fallback
+            const fileUrl = remoteData.url;
+            if (fileUrl) {
+                fetch(fileUrl).then(r => r.json()).then(json => {
+                    processTracks(json);
+                }).catch(err => console.error("Error fetching tracks from storage:", err));
+            }
+        }
+    }
+    
+    // Sync shared productions from directors to administrator
+    if (getIsMusicAdmin()) {
+        const remoteProductionsItem = allConvexStationData.find(item => item.key === 'music_productions');
+        if (remoteProductionsItem && remoteProductionsItem.data) {
+            const convexProds: any[] = desanitizeKeys(remoteProductionsItem.data);
+            if (Array.isArray(convexProds) && convexProds.length > 0) {
+                convexProds.forEach(prod => {
+                    saveProductionToDB(prod).catch(err => {
+                        console.error("Failed to save synced production to IDB:", err);
+                    });
+                });
+            }
+        }
+    }
+  }, [allConvexStationData, tracks]);
+
+  const getUniqueId = (user: GlobalUser) => {
+      const storageKey = `rcm_unique_id_${user.username}`;
+      let id = localStorage.getItem(storageKey);
+      if (!id) {
+          const firstName = user.name ? user.name.split(' ')[0].replace(/[^a-zA-Z]/g, '').toUpperCase() : 'DIR';
+          const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+          const generateBlock = () => {
+              let block = '';
+              for (let i = 0; i < 4; i++) block += chars.charAt(Math.floor(Math.random() * chars.length));
+              return block;
+          };
+          id = `${firstName}-${generateBlock()}-${generateBlock()}-${generateBlock()}`;
+          localStorage.setItem(storageKey, id);
+      }
+      return id;
+  };
+
+  const getIsMusicAdmin = () => {
+    if (!globalUser) return false;
+    
+    // 1. Administrador Global
+    if (globalUser.classification === 'Administrador' || globalUser.username === 'admincmnl') {
+      return true;
+    }
+    
+    // 2. Usuario vinculado to admin_app_static
+    let designatedUserId = 'pedro';
+    const savedEquipo = localStorage.getItem('rcm_equipo_cmnl');
+    if (savedEquipo) {
+      try {
+        const equipo = JSON.parse(savedEquipo);
+        if (Array.isArray(equipo)) {
+          const adminMember = equipo.find((m: any) => m.id === 'admin_app_static');
+          if (adminMember && adminMember.designatedUserId) {
+            designatedUserId = adminMember.designatedUserId;
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    if (globalUser.id === designatedUserId || globalUser.username === designatedUserId) {
+      return true;
+    }
+    
+    // 3. Coordinator / Specialist in Content Management (Especialista en Gestión de Contenido)
+    const userClass = (globalUser.classification || '').toLowerCase();
+    if (userClass.includes('especialista en gestion de contenido') || 
+        userClass.includes('especialista en gestión de contenido') || 
+        userClass.includes('especialista en gestion de contenidos') || 
+        userClass.includes('especialista en gestión de contenidos')) {
+      return true;
+    }
+    
+    if (savedEquipo) {
+      try {
+        const equipo = JSON.parse(savedEquipo);
+        if (Array.isArray(equipo)) {
+          const matchedMember = equipo.find((m: any) => {
+            const spec = (m.specialty || '').toLowerCase();
+            const matchesSpec = spec.includes('especialista en gestion de contenido') || 
+                                spec.includes('especialista en gestión de contenido') || 
+                                spec.includes('especialista en gestion de contenidos') || 
+                                spec.includes('especialista en gestión de contenidos');
+            if (!matchesSpec) return false;
+            return m.id === globalUser.id || m.id === globalUser.username || m.designatedUserId === globalUser.id || m.designatedUserId === globalUser.username;
+          });
+          if (matchedMember) {
+            return true;
+          }
+        }
+      } catch (e) {
+        console.error(e);
+      }
+    }
+    
+    return false;
+  };
+
+  // Map global user to music app user
+  const currentUser: User | null = globalUser ? {
+      username: globalUser.username,
+      password: globalUser.password || '',
+      role: getIsMusicAdmin() ? 'admin' : (globalUser.classification === 'Director' ? 'director' : 'user'),
+      fullName: globalUser.name,
+      phone: globalUser.mobile || '',
+      uniqueId: getUniqueId(globalUser)
+  } : null;
+
+  const authMode: AuthMode = currentUser ? currentUser.role : null;
+
+  const [selectedTrack, setSelectedTrack] = useState<Track | null>(null);
+  const [selectedTracksList, setSelectedTracksList] = useState<Track[]>([]);
+  const [savedSelections, setSavedSelections] = useState<SavedSelection[]>([]);
+  const [navStack, setNavStack] = useState<ViewState[]>([ViewState.LIST]);
+  const [activeRoot, setActiveRoot] = useState<string>('Música 1'); 
+  const [currentPath, setCurrentPath] = useState<string>(''); 
+
+  const [customRoots, setCustomRoots] = useState<string[]>([]);
+  const [activeRootToDownloadPrompt, setActiveRootToDownloadPrompt] = useState<string | null>(null);
+  const [whatsAppPromptPayload, setWhatsAppPromptPayload] = useState<string | null>(null);
+  
+  const [programs, setPrograms] = useState<string[]>(() => {
+      return getActiveProgramsFromStorage();
+  });
+
+  useEffect(() => {
+      if (!isInitialMount.current) {
+          onDirtyChange(true);
+      }
+  }, [tracks, selectedTracksList, savedSelections, customRoots, programs, onDirtyChange]);
+
+  const [showWishlist, setShowWishlist] = useState(false);
+  const [showImportSelectionModal, setShowImportSelectionModal] = useState(false);
+  const [importSelectionText, setImportSelectionText] = useState('');
+  const [wishlistText, setWishlistText] = useState('');
+
+  const [showExportModal, setShowExportModal] = useState(false);
+  const [exportItems, setExportItems] = useState<ExportItem[]>([]);
+  const [programName, setProgramName] = useState(programs[0] || '');
+  const [reportDate, setReportDate] = useState(new Date().toISOString().split('T')[0]);
+  const [editingReportId, setEditingReportId] = useState<string | null>(null); 
+  const [isExportingFromSaved, setIsExportingFromSaved] = useState(false);
+  const [reportsRefreshKey, setReportsRefreshKey] = useState(0);
+
+  const [isUpdating, setIsUpdating] = useState(false);
+  const [isSaving, setIsSaving] = useState(false);
+
+  const navigateTo = (newView: ViewState) => {
+      setNavStack(prev => [...prev, newView]);
+      setView(newView);
+  };
+
+  const navigateBack = () => {
+      if (currentPath !== '') {
+          // Navigate back in folder hierarchy
+          const pathParts = currentPath.split('/');
+          pathParts.pop();
+          setCurrentPath(pathParts.join('/'));
+      } else if (navStack.length > 1) {
+          const newStack = navStack.slice(0, -1);
+          setNavStack(newStack);
+          setView(newStack[newStack.length - 1]);
+      } else {
+          onBack();
+      }
+  };
+
+  useEffect(() => {
+    const initApp = async () => {
+        try { const dbTracks = await loadTracksFromDB(); if (dbTracks.length > 0) setTracks(dbTracks); } catch (e) { console.error(e); }
+        
+        const localUsers = localStorage.getItem(USERS_KEY);
+        let currentUsersList: User[] = [];
+        if (localUsers) { 
+            try { 
+                const parsed = JSON.parse(localUsers); 
+                if (Array.isArray(parsed) && parsed.length > 0) {
+                    currentUsersList = parsed;
+                }
+            } catch { } 
+        }
+        setUsers(currentUsersList);
+
+        const savedRoots = localStorage.getItem(CUSTOM_ROOTS_KEY);
+        if (savedRoots) setCustomRoots(JSON.parse(savedRoots));
+
+        try {
+            const dbSelections = await loadSelectionsFromDB();
+            if (dbSelections.length > 0) setSelectedTracksList(dbSelections);
+        } catch (e) { console.error("Error loading selections", e); }
+
+        try {
+            const dbSavedSelections = await loadSavedSelectionsListFromDB();
+            if (dbSavedSelections.length > 0) {
+                setSavedSelections(dbSavedSelections);
+            } else {
+                // Fallback to localStorage if DB is empty (migration)
+                const savedSels = localStorage.getItem(getSavedSelectionsKey());
+                if (savedSels) setSavedSelections(JSON.parse(savedSels));
+            }
+        } catch (e) { console.error("Error loading saved selections groups", e); }
+
+        setIsLoaded(true);
+    };
+    
+    initApp();
+  }, []);
+
+  useEffect(() => {
+    if (isLoaded) {
+        saveSelectionsToDB(selectedTracksList);
+    }
+  }, [selectedTracksList, isLoaded]);
+
+  useEffect(() => {
+    if (isLoaded) {
+        saveSavedSelectionsListToDB(savedSelections);
+    }
+  }, [savedSelections, isLoaded]);
+
+  useEffect(() => { if (authMode) localStorage.setItem(getSelectionKey(), JSON.stringify(selectedTracksList)); }, [selectedTracksList, authMode]);
+  useEffect(() => { if (authMode) localStorage.setItem(getSavedSelectionsKey(), JSON.stringify(savedSelections)); }, [savedSelections, authMode]);
+
+  const updateTracks = async (newTracksInput: Track[] | ((prev: Track[]) => Track[])) => {
+      let finalTracks: Track[];
+      if (typeof newTracksInput === 'function') { finalTracks = newTracksInput(tracks); } else { finalTracks = newTracksInput; }
+      setTracks(finalTracks);
+      setIsSaving(true);
+      try { 
+          await saveTracksToDB(finalTracks); 
+          if (getIsMusicAdmin()) {
+              const tracksJson = JSON.stringify(finalTracks);
+              const blob = new Blob([tracksJson], { type: 'application/json' });
+              
+              // If small enough, we could still send it directly, but for consistency let's use storage if > 500KB
+              if (blob.size > 500 * 1024) {
+                  const postUrl = await generateUploadUrl();
+                  const result = await fetch(postUrl, {
+                      method: "POST",
+                      headers: { "Content-Type": "application/json" },
+                      body: blob,
+                  });
+                  const { storageId } = await result.json();
+                  
+                  // We need a way to get the URL. In Convex, we can use a query.
+                  // For now, let's just use a placeholder and we'll fix the stationData mutation 
+                  // to optionally resolve storage URLs if we really need to.
+                  // Actually, I'll add a mutation to get the URL.
+                  
+                  await updateStationDataMutation({
+                      key: 'music_tracks',
+                      data: sanitizeKeys({
+                          storageId: storageId,
+                          // We will resolve this in the query side or provide a helper
+                          url: `${window.location.origin}/api/storage/${storageId}` // Placeholder
+                      }),
+                      updatedBy: globalUser?.username || 'admin'
+                  });
+              } else {
+                  await updateStationDataMutation({
+                      key: 'music_tracks',
+                      data: sanitizeKeys(finalTracks),
+                      updatedBy: globalUser?.username || 'admin'
+                  });
+              }
+          }
+      } catch (e) { 
+          console.error("Error guardando DB:", e); 
+      } finally { 
+          setIsSaving(false); 
+      }
+  };
+
+  const handleExportUsersDB = () => {
+      const exportData = { users: users, customRoots: customRoots };
+      const dataStr = JSON.stringify(exportData, null, 2);
+      const blob = new Blob([dataStr], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url; link.download = "musuarios.json";
+      document.body.appendChild(link); link.click(); document.body.removeChild(link); URL.revokeObjectURL(url);
+  };
+
+  const handleSyncRoot = async (rootName: string) => {
+      const config = ROOT_DB_CONFIG[rootName];
+      if (!config) return alert(`No hay configuración remota para ${rootName}`);
+      setIsUpdating(true);
+      try {
+          const r = await fetch(config.url);
+          if (!r.ok) throw new Error("Error DB");
+          const newTracks: Track[] = await r.json();
+          const otherTracks = tracks.filter(t => !t.path.startsWith(rootName));
+          await updateTracks([...otherTracks, ...newTracks]);
+          setIsUpdating(false);
+          alert(`Base de datos de ${rootName} actualizada.`);
+      } catch (e) { 
+          setIsUpdating(false);
+          alert(`Error al actualizar ${rootName}.`); 
+      }
+  };
+
+  const handleExportRoot = (rootName: string) => {
+      const rootTracks = tracks.filter(t => t.path.startsWith(rootName));
+      if (rootTracks.length === 0) return alert(`No hay datos en ${rootName}.`);
+      const config = ROOT_DB_CONFIG[rootName];
+      const dataStr = JSON.stringify(rootTracks, null, 2);
+      const blob = new Blob([dataStr], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url; link.download = config ? config.filename : `${rootName.replace(/\s+/g, '').toLowerCase()}.json`;
+      document.body.appendChild(link); link.click(); document.body.removeChild(link); URL.revokeObjectURL(url);
+  };
+
+  const handleClearRoot = async (rootName: string) => {
+      if (!window.confirm(`¿Borrar ${rootName}?`)) return;
+      const remainingTracks = tracks.filter(t => !t.path.startsWith(rootName));
+      await updateTracks(remainingTracks);
+  };
+
+  const handleAddCustomRoot = (name: string) => { const newRoots = [...customRoots, name]; setCustomRoots(newRoots); localStorage.setItem(CUSTOM_ROOTS_KEY, JSON.stringify(newRoots)); };
+  const handleRenameRoot = async (oldName: string, newName: string) => {
+      const newRoots = customRoots.map(r => r === oldName ? newName : r);
+      setCustomRoots(newRoots); 
+      localStorage.setItem(CUSTOM_ROOTS_KEY, JSON.stringify(newRoots));
+      const updatedTracks = tracks.map(t => t.path.startsWith(oldName) ? { ...t, path: t.path.replace(oldName, newName) } : t);
+      setIsUpdating(true);
+      try {
+          await updateTracks(updatedTracks);
+          setIsUpdating(false);
+          alert(`Carpeta renombrada.`);
+      } catch (e) {
+          setIsUpdating(false);
+          alert("Error al renombrar carpeta.");
+      }
+  };
+
+  const handleUploadMultipleTxt = async (files: FileList, targetRoot: string) => {
+      if (!files || files.length === 0) return;
+      setIsUpdating(true);
+      let allNewParsedTracks: Track[] = [];
+      try {
+          for (let i = 0; i < files.length; i++) {
+              const text = await files[i].text();
+              const parsed = parseTxtDatabase(text, targetRoot);
+              allNewParsedTracks = [...allNewParsedTracks, ...parsed];
+          }
+          
+          const normalize = (s: string) => (s || "").toLowerCase().trim().normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+          const getTrackKey = (t: Track) => `${normalize(t.metadata.title)}|${normalize(t.metadata.performer)}|${normalize(t.metadata.author)}`;
+
+          // Batch process all parsed tracks into a single update
+          await updateTracks(prev => {
+              const updated = [...prev];
+              // Crear un mapa de búsqueda para los tracks existentes
+              const existingMap = new Map<string, number>();
+              updated.forEach((t, i) => {
+                  existingMap.set(getTrackKey(t), i);
+              });
+
+              allNewParsedTracks.forEach(newTrack => {
+                  const key = getTrackKey(newTrack);
+                  const existingIndex = existingMap.get(key);
+
+                  if (existingIndex !== undefined) {
+                      updated[existingIndex] = {
+                          ...newTrack,
+                          id: updated[existingIndex].id 
+                      };
+                  } else {
+                      updated.push(newTrack);
+                      existingMap.set(key, updated.length - 1);
+                  }
+              });
+              return updated;
+          });
+          
+          setIsUpdating(false);
+          alert(`${allNewParsedTracks.length} pistas procesadas correctamente.`);
+      } catch (e) {
+          console.error(e);
+          setIsUpdating(false);
+          alert("Error al cargar archivos TXT.");
+      }
+  };
+
+  const handleSelectTrack = (track: Track) => { setSelectedTrack(track); };
+  const handleToggleSelection = (track: Track) => { 
+      onDirtyChange(true);
+      setSelectedTracksList(prev => prev.find(t => t.id === track.id) ? prev.filter(t => t.id !== track.id) : [...prev, track]); 
+  };
+  const handleMoveSelectionTrack = (fromIndex: number, toIndex: number) => {
+      onDirtyChange(true);
+      setSelectedTracksList(prev => {
+          const list = [...prev];
+          const [moved] = list.splice(fromIndex, 1);
+          list.splice(toIndex, 0, moved);
+          return list;
+      });
+  };
+
+  const [showSaveModal, setShowSaveModal] = useState(false);
+  const [saveName, setSaveName] = useState('');
+  const [showClearConfirm, setShowClearConfirm] = useState(false);
+
+  const [pendingSelectionToLoad, setPendingSelectionToLoad] = useState<SavedSelection | null>(null);
+  const [showLoadConflictModal, setShowLoadConflictModal] = useState(false);
+  const [currentSelectionId, setCurrentSelectionId] = useState<string | null>(null);
+  const [selectionToDelete, setSelectionToDelete] = useState<string | null>(null);
+
+  const handleSaveSelectionClick = () => {
+      if (selectedTracksList.length === 0) return alert("Selección vacía.");
+      
+      // Initialize editing state for the save modal
+      const items: ExportItem[] = selectedTracksList.map(t => ({ 
+          id: t.id, 
+          title: t.metadata.title, 
+          author: t.metadata.author, 
+          authorCountry: t.metadata.authorCountry || '', 
+          performer: t.metadata.performer, 
+          performerCountry: t.metadata.performerCountry || '', 
+          genre: t.metadata.genre || '', 
+          source: 'db', 
+          path: t.path 
+      }));
+      setExportItems(items);
+      
+      if (currentSelectionId) {
+          const sel = savedSelections.find(s => s.id === currentSelectionId);
+          if (sel) {
+              setSaveName(sel.name);
+              if (sel.program) setProgramName(sel.program);
+              if (sel.date) setReportDate(sel.date.split('T')[0]);
+          }
+      } else {
+          setSaveName('');
+          // Keep current programName and reportDate or reset them?
+          // User said "sale la fecha y el nombre... además del programa para escoger"
+          // So we use current state values.
+      }
+      
+      setShowSaveModal(true);
+  };
+
+  const confirmSaveSelection = () => {
+      if (!saveName.trim()) return;
+      
+      // Map exportItems back to Tracks to preserve edits in the saved selection
+      const updatedTracks: Track[] = exportItems.map(item => {
+          const original = selectedTracksList.find(t => t.id === item.id);
+          if (original) {
+              return {
+                  ...original,
+                  metadata: {
+                      ...original.metadata,
+                      title: item.title,
+                      author: item.author,
+                      authorCountry: item.authorCountry,
+                      performer: item.performer,
+                      performerCountry: item.performerCountry,
+                      genre: item.genre
+                  }
+              };
+          } else {
+              return {
+                  id: item.id,
+                  filename: '',
+                  path: 'Manual',
+                  isVerified: false,
+                  metadata: {
+                      title: item.title,
+                      author: item.author,
+                      authorCountry: item.authorCountry,
+                      performer: item.performer,
+                      performerCountry: item.performerCountry,
+                      album: '',
+                      year: '',
+                      genre: item.genre
+                  }
+              };
+          }
+      });
+
+      if (currentSelectionId) {
+          setSavedSelections(prev => {
+              const updated = prev.map(s => 
+                  s.id === currentSelectionId 
+                      ? { ...s, name: saveName.trim(), tracks: updatedTracks, date: new Date(reportDate).toISOString(), program: programName }
+                      : s
+              );
+              saveSavedSelectionsListToDB(updated);
+              return updated;
+          });
+          
+          // Clear selection after update
+          setSelectedTracksList([]);
+          setCurrentSelectionId(null);
+          localStorage.removeItem(getSelectionKey());
+          
+          alert("Selección actualizada correctamente.");
+      } else {
+          if (savedSelections.length >= 5) return alert("Límite de 5 selecciones.");
+          
+          const newSelection: SavedSelection = { 
+              id: `sel-${Date.now()}`, 
+              name: saveName.trim(), 
+              date: new Date(reportDate).toISOString(), 
+              tracks: updatedTracks,
+              program: programName
+          };
+          
+          setSavedSelections(prev => {
+              const updated = [newSelection, ...prev];
+              saveSavedSelectionsListToDB(updated);
+              return updated;
+          });
+          
+          if (pendingSelectionToLoad) {
+              setSelectedTracksList(pendingSelectionToLoad.tracks);
+              setCurrentSelectionId(pendingSelectionToLoad.id);
+              if (pendingSelectionToLoad.program) setProgramName(pendingSelectionToLoad.program);
+              if (pendingSelectionToLoad.date) setReportDate(pendingSelectionToLoad.date.split('T')[0]);
+              setPendingSelectionToLoad(null);
+              alert("Selección actual guardada y nueva selección cargada.");
+          } else {
+              // Clear selection after save
+              setSelectedTracksList([]);
+              setCurrentSelectionId(null);
+              localStorage.removeItem(getSelectionKey());
+              
+              alert("Selección guardada correctamente.");
+          }
+      }
+      
+      setShowSaveModal(false);
+      onDirtyChange?.(true);
+  };
+
+  const handleClearSelectionClick = () => {
+      setShowClearConfirm(true);
+  };
+
+  const confirmClearSelection = () => {
+      setSelectedTracksList([]);
+      setCurrentSelectionId(null);
+      localStorage.removeItem(getSelectionKey());
+      setShowClearConfirm(false);
+  };
+
+  const handleLoadSavedSelection = (sel: SavedSelection) => {
+      if (selectedTracksList.length > 0 && currentSelectionId !== sel.id) {
+          setPendingSelectionToLoad(sel);
+          setShowLoadConflictModal(true);
+      } else {
+          setSelectedTracksList(sel.tracks);
+          setCurrentSelectionId(sel.id);
+          if (sel.program) setProgramName(sel.program);
+          if (sel.date) setReportDate(sel.date.split('T')[0]);
+      }
+  };
+
+  const handleMergeSelection = () => {
+      if (!pendingSelectionToLoad) return;
+      const currentIds = new Set(selectedTracksList.map(t => t.id));
+      const toAdd = pendingSelectionToLoad.tracks.filter(t => !currentIds.has(t.id));
+      setSelectedTracksList(prev => [...prev, ...toAdd]);
+      // When merging, we lose the "identity" of the loaded selection, it becomes a new mix
+      // or we could argue it remains the current one if we were already in one?
+      // Safest is to treat as modified/new if we are merging into something else.
+      // But if we were "New", we stay "New".
+      setPendingSelectionToLoad(null);
+      setShowLoadConflictModal(false);
+      alert("Selecciones integradas.");
+  };
+
+  const handleSaveAndReplaceClick = () => {
+      setShowLoadConflictModal(false);
+      setSaveName('');
+      setShowSaveModal(true);
+  };
+
+  const handleDeleteSavedSelectionClick = (id: string) => { 
+      setSelectionToDelete(id); 
+  };
+
+  const confirmDeleteSelection = () => {
+      if (selectionToDelete) {
+          setSavedSelections(prev => {
+              const updated = prev.filter(s => s.id !== selectionToDelete);
+              saveSavedSelectionsListToDB(updated);
+              return updated;
+          });
+          if (currentSelectionId === selectionToDelete) {
+              setCurrentSelectionId(null);
+          }
+          setSelectionToDelete(null);
+      }
+  };
+
+  const handleProcessImportSelection = () => {
+      if (!importSelectionText.trim()) return;
+      const lines = importSelectionText.split('\n').map(l => l.trim()).filter(l => l);
+      let pName = '';
+      let pDate = '';
+      const importedTracks: Track[] = [];
+
+      interface TempTrack {
+          title: string;
+          author?: string;
+          authorCountry?: string;
+          performer?: string;
+          performerCountry?: string;
+          genre?: string;
+          path?: string;
+      }
+
+      let currentTrack: TempTrack | null = null;
+
+      const processAndPushCurrentTrack = (item: TempTrack) => {
+          const tTitle = (item.title || "Tema Desconocido")
+              .replace(/\*/g, '')
+              .replace(/^\d+\s*[\.\-]?\s*/, '')
+              .trim();
+          
+          const tAuthor = (item.author || "Desconocido").trim();
+          const tAuthorCountry = (item.authorCountry || "Cuba").trim();
+          const tPerformer = (item.performer || "Desconocido").trim();
+          const tPerformerCountry = (item.performerCountry || "Cuba").trim();
+          const tGenre = (item.genre || "Desconocido").trim();
+          const tPath = (item.path || "Manual").trim();
+
+          // Try database match
+          let foundTrack = tracks.find(t => 
+              (t.path || '').toLowerCase() === tPath.toLowerCase() && 
+              t.metadata.title.toLowerCase().includes(tTitle.toLowerCase())
+          );
+
+          if (!foundTrack && tTitle) {
+              foundTrack = tracks.find(t => 
+                  t.metadata.title.toLowerCase().includes(tTitle.toLowerCase()) && 
+                  (t.metadata.performer || '').toLowerCase().includes(tPerformer.toLowerCase())
+              );
+          }
+
+          if (foundTrack) {
+              importedTracks.push(foundTrack);
+          } else {
+              const dummyTrack: Track = {
+                  id: 'manual_' + Date.now().toString() + '_' + Math.random().toString(36).substring(2, 5) + '_' + Math.random().toString(36).substring(2, 5),
+                  filename: tTitle + '.mp3',
+                  path: tPath,
+                  isVerified: false,
+                  metadata: { 
+                      title: tTitle, 
+                      author: tAuthor, 
+                      authorCountry: tAuthorCountry, 
+                      performer: tPerformer, 
+                      performerCountry: tPerformerCountry, 
+                      genre: tGenre, 
+                      album: '', 
+                      year: new Date().getFullYear().toString() 
+                  }
+              };
+              importedTracks.push(dummyTrack);
+          }
+      };
+
+      for (let i = 0; i < lines.length; i++) {
+          const line = lines[i];
+          const lowerLine = line.toLowerCase();
+
+          if (lowerLine.startsWith('*programa:*') || lowerLine.startsWith('programa:')) {
+              pName = line.split(':')[1]?.replace(/\*/g, '').trim() || '';
+          } else if (lowerLine.startsWith('*fecha:*') || lowerLine.startsWith('fecha:')) {
+              pDate = line.split(':')[1]?.replace(/\*/g, '').trim() || '';
+          } else if (line.startsWith('🎵')) {
+              if (currentTrack) {
+                  processAndPushCurrentTrack(currentTrack);
+              }
+              const content = line.replace('🎵', '').trim();
+              const parts = content.split(' - ');
+              if (parts.length >= 3) {
+                  const titleRaw = parts[0];
+                  const authorRaw = parts[1];
+                  const performerRaw = parts.slice(2).join(' - ');
+                  currentTrack = {
+                      title: titleRaw,
+                      author: authorRaw,
+                      performer: performerRaw
+                  };
+              } else if (parts.length === 2) {
+                  const titleRaw = parts[0];
+                  const performerRaw = parts[1];
+                  currentTrack = {
+                      title: titleRaw,
+                      author: 'Desconocido',
+                      performer: performerRaw
+                  };
+              } else {
+                  currentTrack = {
+                      title: content
+                  };
+              }
+          } else if (currentTrack) {
+              if (lowerLine.startsWith('autor:')) {
+                  const rawAuthor = line.replace(/^autor:\s*/i, '').trim();
+                  const matchCountry = rawAuthor.match(/^(.*?)\s*\(([^)]+)\)$/);
+                  if (matchCountry) {
+                      currentTrack.author = matchCountry[1].trim();
+                      currentTrack.authorCountry = matchCountry[2].trim();
+                  } else {
+                      currentTrack.author = rawAuthor;
+                  }
+              } else if (lowerLine.startsWith('intérprete:') || lowerLine.startsWith('interprete:')) {
+                  const rawPerformer = line.replace(/^(intérprete:|interprete:)\s*/i, '').trim();
+                  const matchCountry = rawPerformer.match(/^(.*?)\s*\(([^)]+)\)$/);
+                  if (matchCountry) {
+                      currentTrack.performer = matchCountry[1].trim();
+                      currentTrack.performerCountry = matchCountry[2].trim();
+                  } else {
+                      currentTrack.performer = rawPerformer;
+                  }
+              } else if (lowerLine.startsWith('género:') || lowerLine.startsWith('genero:')) {
+                  currentTrack.genre = line.replace(/^(género:|genero:)\s*/i, '').trim();
+              } else if (line.startsWith('📂')) {
+                  const pathMatch = line.match(/_([^_]+)_/);
+                  const pathContent = pathMatch ? pathMatch[1] : line.replace('📂', '').replace(/_/g, '').trim();
+                  currentTrack.path = pathContent;
+              }
+          }
+      }
+
+      if (currentTrack) {
+          processAndPushCurrentTrack(currentTrack);
+      }
+
+      if (importedTracks.length > 0) {
+          if (!pName) pName = 'Importada';
+          const newSelection: SavedSelection = {
+              id: `sel-imp-${Date.now()}`,
+              name: `${pName}`,
+              date: pDate || new Date().toISOString().split('T')[0],
+              tracks: importedTracks,
+              program: pName
+          };
+          setSavedSelections(prev => {
+              const updated = [newSelection, ...prev];
+              saveSavedSelectionsListToDB(updated);
+              return updated;
+          });
+          alert(`Selección importada con ${importedTracks.length} temas.`);
+      } else {
+          alert("No se pudieron extraer temas.");
+      }
+      setShowImportSelectionModal(false);
+      setImportSelectionText('');
+  };
+
+  const parsePlaylistText = (text: string) => {
+      const parsedTracks: {
+          title?: string;
+          author?: string;
+          authorCountry?: string;
+          performer?: string;
+          performerCountry?: string;
+          genre?: string;
+          album?: string;
+          year?: string;
+      }[] = [];
+
+      const cleanText = text.replace(/\*\*/g, '');
+
+      // Identify if the text has structured label declarations by looking for colons
+      const hasLabels = /:/g.test(cleanText);
+
+      const cleanLeadingNumbering = (t: string): string => {
+          return t.replace(/^[\d\s\.\-\)\]\[\*(#:]+/g, '').trim();
+      };
+
+      if (hasLabels) {
+          const lines = cleanText.split(/\r?\n|\r|\u2028/).map(l => l.trim());
+
+          const normalizeKey = (key: string): string => {
+              const base = key.toLowerCase()
+                              .normalize("NFD")
+                              .replace(/[\u0300-\u036f]/g, "")
+                              .trim();
+              if (base.startsWith('tit') || base.startsWith('nom') || base.startsWith('tem') || base.startsWith('canc')) return 'titulo';
+              if (base.startsWith('aut') || base.startsWith('comp') || base.startsWith('crea') || base.startsWith('let')) return 'autor';
+              if (base.startsWith('int') || base.startsWith('cant') || base.startsWith('art') || base.startsWith('grup')) return 'interprete';
+              if (base.startsWith('pa') || base.startsWith('orig') || base.startsWith('nac')) return 'pais';
+              if (base.startsWith('disc') || base.startsWith('alb')) return 'album';
+              if (base.startsWith('an') || base.startsWith('ye') || base.startsWith('fech')) return 'ano';
+              if (base.startsWith('gen') || base.startsWith('est')) return 'genero';
+              if (base.startsWith('disq') || base.startsWith('sell')) return 'disquera';
+              return base;
+          };
+
+          let currentTrack: any = null;
+          let lastKeyContext: string = '';
+
+          for (const line of lines) {
+              if (!line) continue;
+
+              // If the line is purely a number or separator (without colons), skip it.
+              if (/^\d+[\.\s\-)]*$/i.test(line) && !line.includes(':')) {
+                  continue;
+              }
+
+              const colonIndex = line.indexOf(':');
+              if (colonIndex !== -1) {
+                  const beforeColon = line.substring(0, colonIndex).trim();
+                  const afterColon = line.substring(colonIndex + 1).trim();
+
+                  // Strip leading numbering/symbols from the field key
+                  let fieldPart = cleanLeadingNumbering(beforeColon);
+                  if (!fieldPart) {
+                      fieldPart = beforeColon;
+                  }
+
+                  // "la primera palabra de cada linea el nombre del campo"
+                  const words = fieldPart.split(/\s+/);
+                  const firstWord = words[0] || '';
+
+                  if (firstWord) {
+                      const normKey = normalizeKey(firstWord);
+
+                      let val = afterColon
+                                        .replace(/^[:\s,;\-*]+/, '')
+                                        .replace(/[:\s,;\-*]+$/, '')
+                                        .trim();
+                      if (!val) {
+                          val = '---';
+                      }
+
+                      if (normKey === 'titulo') {
+                          if (currentTrack) {
+                              parsedTracks.push(currentTrack);
+                          }
+                          currentTrack = { title: val };
+                          lastKeyContext = 'titulo';
+                      } else if (currentTrack) {
+                          if (normKey === 'autor') {
+                              currentTrack.author = val;
+                              lastKeyContext = 'autor';
+                          } else if (normKey === 'interprete') {
+                              currentTrack.performer = val;
+                              lastKeyContext = 'interprete';
+                          } else if (normKey === 'pais') {
+                              if (lastKeyContext === 'autor') {
+                                  currentTrack.authorCountry = val;
+                              } else if (lastKeyContext === 'interprete') {
+                                  currentTrack.performerCountry = val;
+                              } else {
+                                  if (!currentTrack.authorCountry) {
+                                      currentTrack.authorCountry = val;
+                                  } else {
+                                      currentTrack.performerCountry = val;
+                                  }
+                              }
+                          } else if (normKey === 'genero') {
+                              currentTrack.genre = val;
+                          } else if (normKey === 'album') {
+                              currentTrack.album = val;
+                          } else if (normKey === 'ano') {
+                              currentTrack.year = val;
+                          }
+                      }
+                  }
+              }
+          }
+
+          if (currentTrack) {
+              parsedTracks.push(currentTrack);
+          }
+      } else {
+          const rawLines = cleanText.split(/\r?\n/).map(l => l.trim()).filter(l => l.length > 0);
+          for (const line of rawLines) {
+              let parts: string[] = [];
+              if (line.includes('\t')) {
+                  parts = line.split('\t').map(p => p.trim());
+              } else if (line.includes(';')) {
+                  parts = line.split(';').map(p => p.trim());
+              } else if (line.includes(',')) {
+                  parts = line.split(',').map(p => p.trim());
+              }
+
+              if (parts.length >= 2) {
+                  const track: any = {};
+                  if (parts[0]) track.title = cleanLeadingNumbering(parts[0]);
+                  if (parts[1]) track.author = parts[1].trim();
+                  
+                  if (parts.length === 3) {
+                      track.performer = parts[2];
+                  } else if (parts.length === 4) {
+                      track.performer = parts[2];
+                      track.genre = parts[3];
+                  } else if (parts.length === 5) {
+                      track.authorCountry = parts[2];
+                      track.performer = parts[3];
+                      track.genre = parts[4];
+                  } else if (parts.length >= 6) {
+                      track.authorCountry = parts[2];
+                      track.performer = parts[3];
+                      track.performerCountry = parts[4];
+                      track.genre = parts[5];
+                  }
+                  parsedTracks.push(track);
+              } else {
+                  if (line.length > 2) {
+                      parsedTracks.push({ title: cleanLeadingNumbering(line) });
+                  }
+              }
+          }
+      }
+
+      return parsedTracks;
+  };
+
+  const getSimilarity = (s1: string, s2: string): number => {
+      const len1 = s1.length;
+      const len2 = s2.length;
+      if (len1 === 0) return len2 === 0 ? 1 : 0;
+      if (len2 === 0) return 0;
+      const matrix: number[][] = [];
+      for (let i = 0; i <= len1; i++) matrix[i] = [i];
+      for (let j = 0; j <= len2; j++) matrix[0][j] = j;
+      for (let i = 1; i <= len1; i++) {
+          for (let j = 1; j <= len2; j++) {
+              const cost = s1[i - 1] === s2[j - 1] ? 0 : 1;
+              matrix[i][j] = Math.min(matrix[i - 1][j] + 1, matrix[i][j - 1] + 1, matrix[i - 1][j - 1] + cost);
+          }
+      }
+      return 1 - matrix[len1][len2] / Math.max(len1, len2);
+  };
+
+  const checkPerformerInPath = (path: string, performer: string): boolean => {
+      if (!path || !performer || path === 'Carga Externa' || path === 'Manual') return false;
+      const normalize = (s: string) => (s || "").toLowerCase().normalize("NFD").replace(/[\u0300-\u036f]/g, "").trim();
+      const normalizedPerformer = normalize(performer);
+      if (!normalizedPerformer || normalizedPerformer === '---') return false;
+      const pathParts = path.split('/').filter(p => p.length > 0);
+      if (pathParts.length > 0) pathParts.pop(); // Remove filename
+      return pathParts.some(part => {
+          const normalizedPart = normalize(part);
+          if (normalizedPart.includes(normalizedPerformer) || normalizedPerformer.includes(normalizedPart)) return true;
+          if (getSimilarity(normalizedPart, normalizedPerformer) >= 0.8) return true;
+          return false;
+      });
+  };
+
+  const handleProcessWishlist = () => {
+      if (!wishlistText.trim()) return;
+      const parsedList = parsePlaylistText(wishlistText);
+      const resolvedTracks: Track[] = [];
+      const tracksToUpdateInDb: Track[] = [];
+      const updatedTracksForUserText: { title: string, author: string, authorCountry: string, performer: string, performerCountry: string, genre: string, album: string, year: string }[] = [];
+
+      const isAdminOrCoordinator = authMode === 'admin';
+
+      const findRootForTrack = (track: Track): string => {
+          for (const key of Object.keys(ROOT_DB_CONFIG)) {
+              if (track.path && track.path.startsWith(key)) {
+                  return key;
+              }
+          }
+          return activeRoot;
+      };
+
+      parsedList.forEach((item, idx) => {
+          const cleanTitle = (item.title || "").trim().toLowerCase();
+          const cleanAuthor = (item.author || "").trim().toLowerCase();
+
+          // Try database match by title and author
+          let matchedDbTrack = tracks.find(t => {
+              const tTitle = t.metadata.title.toLowerCase();
+              const tAuthor = t.metadata.author.toLowerCase();
+              return tTitle === cleanTitle && (!cleanAuthor || tAuthor.includes(cleanAuthor) || cleanAuthor.includes(tAuthor));
+          });
+
+          // Fallback to title-only match
+          if (!matchedDbTrack) {
+              matchedDbTrack = tracks.find(t => t.metadata.title.toLowerCase() === cleanTitle);
+          }
+
+          // Merge fields prioritizing copy-pasted data, then DB fallback, then blank ""
+          const finalMetadata = {
+              title: (item.title !== undefined ? item.title : (matchedDbTrack ? matchedDbTrack.metadata.title : "")).trim(),
+              author: (item.author !== undefined ? item.author : (matchedDbTrack ? matchedDbTrack.metadata.author : "")).trim(),
+              authorCountry: (item.authorCountry !== undefined ? item.authorCountry : (matchedDbTrack ? matchedDbTrack.metadata.authorCountry : "")).trim(),
+              performer: (item.performer !== undefined ? item.performer : (matchedDbTrack ? matchedDbTrack.metadata.performer : "")).trim(),
+              performerCountry: (item.performerCountry !== undefined ? item.performerCountry : (matchedDbTrack ? matchedDbTrack.metadata.performerCountry : "")).trim(),
+              genre: (item.genre !== undefined ? item.genre : (matchedDbTrack ? matchedDbTrack.metadata.genre : "")).trim(),
+              album: (item.album !== undefined ? item.album : (matchedDbTrack ? matchedDbTrack.metadata.album : "")).trim(),
+              year: (item.year !== undefined ? item.year : (matchedDbTrack ? matchedDbTrack.metadata.year : "")).trim()
+          };
+
+          if (matchedDbTrack) {
+              const originalMeta = matchedDbTrack.metadata;
+              let isUpdatedInDb = false;
+
+              // Compare fields to see if metadata is enriched or changed
+              if (finalMetadata.title !== originalMeta.title) isUpdatedInDb = true;
+              if (finalMetadata.author !== originalMeta.author) isUpdatedInDb = true;
+              if (finalMetadata.authorCountry !== (originalMeta.authorCountry || '')) isUpdatedInDb = true;
+              if (finalMetadata.performer !== originalMeta.performer) isUpdatedInDb = true;
+              if (finalMetadata.performerCountry !== (originalMeta.performerCountry || '')) isUpdatedInDb = true;
+              if (finalMetadata.genre !== (originalMeta.genre || '')) isUpdatedInDb = true;
+              if (finalMetadata.album !== (originalMeta.album || '')) isUpdatedInDb = true;
+              if (finalMetadata.year !== (originalMeta.year || '')) isUpdatedInDb = true;
+
+              const isPathValid = checkPerformerInPath(matchedDbTrack.path, finalMetadata.performer);
+              
+              const resolvedTrack: Track = {
+                  ...matchedDbTrack,
+                  metadata: finalMetadata,
+                  path: isPathValid ? matchedDbTrack.path : 'Carga Externa'
+              };
+
+              if (isUpdatedInDb) {
+                  tracksToUpdateInDb.push(resolvedTrack);
+                  if (!isAdminOrCoordinator) {
+                      updatedTracksForUserText.push({
+                          title: finalMetadata.title,
+                          author: finalMetadata.author,
+                          authorCountry: finalMetadata.authorCountry,
+                          performer: finalMetadata.performer,
+                          performerCountry: finalMetadata.performerCountry,
+                          genre: finalMetadata.genre,
+                          album: finalMetadata.album,
+                          year: finalMetadata.year
+                      });
+                  }
+              }
+
+              if (!resolvedTracks.some(r => r.id === resolvedTrack.id)) {
+                  resolvedTracks.push(resolvedTrack);
+              }
+          } else {
+              // Create virtual Track with unified metadata (missing fields left blank)
+              const virtualId = `track-virtual-${Date.now()}-${idx}-${Math.random().toString(36).substring(2, 5)}`;
+              const virtualTrack: Track = {
+                  id: virtualId,
+                  filename: `${finalMetadata.title || 'Desconocido'}.mp3`,
+                  path: 'Carga Externa',
+                  isVerified: true,
+                  metadata: finalMetadata
+              };
+              resolvedTracks.push(virtualTrack);
+          }
+      });
+
+      // Update in local DB either way
+      if (tracksToUpdateInDb.length > 0) {
+          const updatedTracksList = tracks.map(t => {
+              const found = tracksToUpdateInDb.find(ut => ut.id === t.id);
+              return found ? found : t;
+          });
+          updateTracks(updatedTracksList);
+
+          if (isAdminOrCoordinator) {
+              const updatedRoots = new Set<string>();
+              tracksToUpdateInDb.forEach(t => {
+                  updatedRoots.add(findRootForTrack(t));
+              });
+              const rootToPrompt = Array.from(updatedRoots)[0] || activeRoot;
+              setActiveRootToDownloadPrompt(rootToPrompt);
+          } else if (updatedTracksForUserText.length > 0) {
+              // Format txt block report
+              let textMessage = "Hola Administrador. Aquí tienes los nuevos datos para actualizar la base de datos de música:\n\n";
+              updatedTracksForUserText.forEach(t => {
+                  textMessage += `Título: ${t.title}\n`;
+                  textMessage += `Autor: ${t.author}\n`;
+                  if (t.authorCountry) textMessage += `País: ${t.authorCountry}\n`;
+                  textMessage += `Intérprete: ${t.performer}\n`;
+                  if (t.performerCountry) textMessage += `País: ${t.performerCountry}\n`;
+                  if (t.album) textMessage += `Disco: ${t.album}\n`;
+                  if (t.year) textMessage += `Año: ${t.year}\n`;
+                  if (t.genre) textMessage += `Género: ${t.genre}\n`;
+                  textMessage += `\n`;
+              });
+              setWhatsAppPromptPayload(textMessage);
+          }
+      }
+
+      if (resolvedTracks.length > 0) {
+          setSelectedTracksList(prev => {
+              const resolvedIds = new Set(resolvedTracks.map(t => t.id));
+              const remainingPrev = prev.filter(t => !resolvedIds.has(t.id));
+              return [...remainingPrev, ...resolvedTracks];
+          });
+          alert(`Lista cargada con éxito: se agregaron y generaron ${resolvedTracks.length} temas.`);
+      } else {
+          alert("No se pudieron extraer temas válidos con el formato requerido en la lista.");
+      }
+      setShowWishlist(false);
+      setWishlistText('');
+  };
+
+  const handleOpenExportModal = () => {
+      setEditingReportId(null);
+      setIsExportingFromSaved(false);
+      setReportDate(new Date().toISOString().split('T')[0]);
+      let items: ExportItem[] = selectedTracksList.map(t => ({ id: t.id, title: t.metadata.title, author: t.metadata.author, authorCountry: t.metadata.authorCountry || '', performer: t.metadata.performer, performerCountry: t.metadata.performerCountry || '', genre: t.metadata.genre || '', source: 'db', path: t.path }));
+      if (items.length === 0) {
+          items = [{
+              id: 'manual_' + Date.now().toString() + '_' + Math.random().toString(36).substring(2, 5),
+              title: '',
+              author: '',
+              authorCountry: '',
+              performer: '',
+              performerCountry: '',
+              genre: '',
+              source: 'manual',
+              path: 'Manual'
+          }];
+      }
+      setExportItems(items); setShowExportModal(true);
+  };
+
+  const handleUpdateExportItem = (index: number, field: keyof ExportItem, value: string) => {
+      const newItems = [...exportItems]; newItems[index] = { ...newItems[index], [field]: value }; setExportItems(newItems);
+  };
+
+  const handleRemoveExportItem = (indexToRemove: number) => {
+      setExportItems(prev => prev.filter((_, idx) => idx !== indexToRemove));
+  };
+
+  const handleAddNewExportItem = () => {
+      const newItem: ExportItem = {
+          id: 'manual_' + Date.now().toString() + '_' + Math.random().toString(36).substring(2, 5),
+          title: '',
+          author: '',
+          authorCountry: '',
+          performer: '',
+          performerCountry: '',
+          genre: '',
+          source: 'manual',
+          path: 'Manual'
+      };
+      setExportItems(prev => [newItem, ...prev]);
+  };
+
+  const handleShareWhatsApp = () => {
+      let message = `*CRÉDITOS RCM*\n*Programa:* ${programName}\n*Fecha:* ${reportDate}\n\n`;
+      exportItems.forEach((item, index) => {
+          message += `🎵 ${index + 1}. *${item.title}*\n`;
+          message += `Autor: ${item.author || 'Desconocido'} (${item.authorCountry || 'Cuba'})\n`;
+          message += `Intérprete: ${item.performer || 'Desconocido'} (${item.performerCountry || 'Cuba'})\n`;
+          message += `Género: ${item.genre || 'Desconocido'}\n`;
+          if (item.path && item.path !== 'Manual' && item.path !== 'Carga Externa') {
+              message += `📂 _${item.path}_\n`;
+          } else {
+              message += `📂 _Manual_\n`;
+          }
+          message += `\n`;
+      });
+      openWhatsApp(message);
+  };
+
+  const handleDownloadReport = async () => {
+      if (!currentUser) return;
+      const pdfBlob = generateReportPDF({ 
+          userFullName: currentUser.fullName, 
+          userUniqueId: currentUser.uniqueId || 'N/A', 
+          program: programName, 
+          date: reportDate,
+          items: exportItems 
+      });
+      const fileName = `PM-${programName}-${reportDate}.pdf`;
+      await saveReportToDB({ 
+          id: editingReportId || `rep-${Date.now()}`, 
+          date: reportDate, 
+          program: programName, 
+          generatedBy: currentUser.username, 
+          fileName, 
+          pdfBlob, 
+          items: exportItems, 
+          status: { downloaded: false, sent: false } 
+      });
+      
+      if (editingReportId) {
+          alert("Reporte actualizado correctamente.");
+          setReportsRefreshKey(prev => prev + 1);
+      } else {
+          alert("Reporte generado y guardado en Registros.");
+          
+          if (isExportingFromSaved) {
+              // Clear saved selections if we exported from there
+              setSavedSelections([]);
+              saveSavedSelectionsListToDB([]);
+              localStorage.removeItem(getSavedSelectionsKey());
+          } else {
+              // Clear current selection
+              setSelectedTracksList([]);
+              setCurrentSelectionId(null);
+              localStorage.removeItem(getSelectionKey());
+          }
+      }
+      
+      setShowExportModal(false);
+  };
+
+  const handleSaveEdit = (updatedTrack: Track) => {
+      onDirtyChange(true);
+      updateTracks(prev => prev.map(t => t.id === updatedTrack.id ? updatedTrack : t));
+      if (view === ViewState.SELECTION) setSelectedTracksList(prev => prev.map(t => t.id === updatedTrack.id ? updatedTrack : t));
+      setSelectedTrack(null);
+  };
+
+  const handleEditReport = (report: Report) => {
+      setEditingReportId(report.id);
+      setProgramName(report.program);
+      // Ensure we only take the date part if it's an ISO string
+      setReportDate(report.date.split('T')[0]);
+      setExportItems(report.items || []);
+      setShowExportModal(true);
+  };
+
+  const handleBulkExport = async () => {
+      if (!currentUser) return;
+      setIsUpdating(true);
+      try {
+          const now = Date.now();
+          const todayStr = new Date().toISOString().split('T')[0];
+          for (let i = 0; i < savedSelections.length; i++) {
+              const sel = savedSelections[i];
+              const items: ExportItem[] = sel.tracks.map(t => ({ id: t.id, title: t.metadata.title, author: t.metadata.author, authorCountry: t.metadata.authorCountry || '', performer: t.metadata.performer, performerCountry: t.metadata.performerCountry || '', genre: t.metadata.genre || '', source: 'db', path: t.path }));
+              const pdfBlob = generateReportPDF({ 
+                  userFullName: currentUser.fullName, 
+                  userUniqueId: currentUser.uniqueId || 'N/A', 
+                  program: programName, 
+                  date: todayStr,
+                  items: items 
+              });
+              const fileName = `PM-${sel.name}-${todayStr}.pdf`;
+              await saveReportToDB({ 
+                  id: `rep-${now}-${i}-${sel.id}`, 
+                  date: todayStr, 
+                  program: programName, 
+                  generatedBy: currentUser.username, 
+                  fileName, 
+                  pdfBlob, 
+                  items: items, 
+                  status: { downloaded: false, sent: false } 
+              });
+          }
+          // Clear saved selections after bulk export
+          setSavedSelections([]);
+          saveSavedSelectionsListToDB([]);
+          localStorage.removeItem(getSavedSelectionsKey());
+          
+          alert("Se generaron los pdf de las selecciones musicales, consulte en Reportes.");
+      } catch (e) {
+          console.error(e);
+          alert("Error al generar reportes masivos.");
+      } finally {
+          setIsUpdating(false);
+      }
+  };
+
+  const handleSelectionAction = async () => {
+      if (selectedTracksList.length > 0) {
+          handleOpenExportModal();
+      } else if (savedSelections.length > 0) {
+          if (savedSelections.length === 1) {
+              const sel = savedSelections[0];
+              setEditingReportId(null);
+              setIsExportingFromSaved(true);
+              setProgramName(programName);
+              setReportDate(new Date().toISOString().split('T')[0]);
+              setExportItems(sel.tracks.map(t => ({ id: t.id, title: t.metadata.title, author: t.metadata.author, authorCountry: t.metadata.authorCountry || '', performer: t.metadata.performer, performerCountry: t.metadata.performerCountry || '', genre: t.metadata.genre || '', source: 'db', path: t.path })));
+              setShowExportModal(true);
+          } else {
+              await handleBulkExport();
+          }
+      }
+  };
+
+  return (
+    <div className="min-h-screen bg-[#1A100C] text-[#E8DCCF] font-display flex flex-col">
+      <CMNLHeader 
+        user={globalUser ? { name: globalUser.name, role: globalUser.role } : null}
+        sectionTitle="Música CMNL"
+        onMenuClick={onMenuClick}
+        onBack={navigateBack}
+      />
+      
+      <div className="flex-1 overflow-hidden relative flex flex-col">
+            {view === ViewState.LIST && (
+                <TrackList 
+                    tracks={tracks} onSelectTrack={handleSelectTrack} onUploadTxt={handleUploadMultipleTxt} isAdmin={authMode === 'admin'} 
+                    onSyncRoot={handleSyncRoot} onExportRoot={handleExportRoot} onClearRoot={handleClearRoot} 
+                    customRoots={customRoots} onAddCustomRoot={handleAddCustomRoot} onRenameRoot={handleRenameRoot}
+                    selectedTrackIds={new Set(selectedTracksList.map(t => t.id))} onToggleSelection={handleToggleSelection}
+                    activeRoot={activeRoot} setActiveRoot={setActiveRoot} currentPath={currentPath} setCurrentPath={setCurrentPath}
+                />
+            )}
+            
+            {view === ViewState.SELECTION && (
+                <div className="h-full bg-[#1A100C] flex flex-col">
+                     <div className="p-4 bg-[#2C1B15] border-b border-[#9E7649]/20 flex items-center justify-between">
+                          <div className="flex flex-col">
+                              <h2 className="font-bold text-white flex items-center gap-2"><span className="material-symbols-outlined text-[#9E7649]">checklist</span> Selección</h2>
+                              {currentSelectionId && (
+                                  <span className="text-xs text-[#9E7649] font-bold ml-8">
+                                      {savedSelections.find(s => s.id === currentSelectionId)?.name}
+                                  </span>
+                              )}
+                          </div>
+                          <div className="flex gap-2">
+                              {authMode === 'director' && (
+                                  <button onClick={() => setShowImportSelectionModal(true)} className="text-[9px] font-bold uppercase bg-blue-900/20 text-blue-400 px-3 py-1.5 rounded-lg flex items-center gap-1">Importar</button>
+                              )}
+                              <button onClick={() => setShowWishlist(true)} className="text-[9px] font-bold uppercase bg-[#9E7649]/10 text-[#9E7649] px-3 py-1.5 rounded-lg flex items-center gap-1">
+                                  <span className="material-symbols-outlined text-[10px]">playlist_add</span> Cargar Lista
+                              </button>
+                              <button onClick={handleClearSelectionClick} className="text-[9px] font-bold uppercase bg-red-900/20 text-red-400 px-3 py-1.5 rounded-lg flex items-center gap-1">Limpiar</button>
+                          </div>
+                     </div>
+                     
+                     {savedSelections.length > 0 && (
+                        <div className="flex flex-col">
+                            <div className="bg-[#2C1B15] border-b border-[#9E7649]/10 p-2">
+                                <p className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase tracking-widest px-2 mb-2">Guardadas ({savedSelections.length}/5)</p>
+                                <div className="flex gap-2 overflow-x-auto no-scrollbar pb-1 px-2">
+                                    {savedSelections.map(sel => (
+                                        <div key={sel.id} className={`flex-none border rounded-lg p-2 min-w-[120px] flex flex-col gap-1 ${currentSelectionId === sel.id ? 'bg-[#9E7649]/10 border-[#9E7649]' : 'bg-[#1A100C] border-[#9E7649]/20'}`}>
+                                            <div className="flex justify-between items-start">
+                                                <span className="font-bold text-xs text-white truncate w-20">{sel.name}</span>
+                                                <button onClick={() => handleDeleteSavedSelectionClick(sel.id)} className="text-[#E8DCCF]/40 hover:text-red-400"><span className="material-symbols-outlined text-xs">close</span></button>
+                                            </div>
+                                            <div className="text-[9px] text-[#E8DCCF]/60">{sel.tracks.length} temas</div>
+                                            <button onClick={() => handleLoadSavedSelection(sel)} className={`text-[9px] border rounded py-1 font-bold transition-colors ${currentSelectionId === sel.id ? 'bg-[#9E7649] text-white border-[#9E7649]' : 'bg-[#2C1B15] border-[#9E7649]/30 text-[#9E7649] hover:bg-[#9E7649] hover:text-white'}`}>
+                                                {currentSelectionId === sel.id ? 'Actualizar' : 'Cargar'}
+                                            </button>
+                                        </div>
+                                    ))}
+                                </div>
+                            </div>
+                        </div>
+                     )}
+
+                     <div className="flex-1 overflow-y-auto">
+                        <TrackList 
+                            tracks={selectedTracksList} onSelectTrack={handleSelectTrack} onUploadTxt={() => {}} isAdmin={false} 
+                            onSyncRoot={() => {}} onExportRoot={() => {}} onClearRoot={() => {}} 
+                            isSelectionView={true} customRoots={[]} onAddCustomRoot={() => {}} onRenameRoot={() => {}}
+                            onToggleSelection={handleToggleSelection} selectedTrackIds={new Set(selectedTracksList.map(t => t.id))}
+                            onMoveItem={authMode === 'director' ? handleMoveSelectionTrack : undefined}
+                        />
+                     </div>
+                     <div className="p-4 bg-[#2C1B15] border-t border-[#9E7649]/20 flex flex-col gap-2">
+                          <button onClick={handleSaveSelectionClick} className={`w-full text-white py-3 rounded-xl font-bold text-xs shadow-md flex items-center justify-center gap-2 ${currentSelectionId ? 'bg-blue-600 hover:bg-blue-700' : 'bg-green-600 hover:bg-green-700'}`}>
+                              <span className="material-symbols-outlined text-sm">{currentSelectionId ? 'sync' : 'save'}</span> 
+                              {currentSelectionId ? 'Actualizar Selección' : 'Guardar Selección'}
+                          </button>
+                          <button onClick={handleOpenExportModal} className="w-full bg-[#9E7649] text-white py-3.5 rounded-xl font-bold text-sm shadow-md flex items-center justify-center gap-2 hover:bg-[#8B653D]">
+                             <span className="material-symbols-outlined">ios_share</span> {selectedTracksList.length > 0 ? 'Exportar / Compartir' : 'Exportar Selección'}
+                           </button>
+                           {selectedTracksList.length === 0 && savedSelections.length > 0 && (
+                               <button onClick={handleSelectionAction} className="w-full bg-amber-700/80 hover:bg-amber-800 text-white py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-md transition-colors uppercase tracking-wider">
+                                  <span className="material-symbols-outlined text-sm">dynamic_feed</span> {savedSelections.length === 1 ? 'Exportar Selección Guardada' : 'Exportar Selección Masiva'}
+                               </button>
+                           )}
+                           <button className="hidden" style={{ display: 'none' }}>
+                          </button>
+                     </div>
+                </div>
+            )}
+
+            {/* Modals */}
+            {selectionToDelete && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setSelectionToDelete(null)}>
+                    <div className="w-full max-w-sm bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                        <h3 className="font-bold text-lg mb-2 text-white">¿Eliminar Selección?</h3>
+                        <p className="text-sm text-[#E8DCCF]/60 mb-6">Se eliminará la selección guardada "{savedSelections.find(s => s.id === selectionToDelete)?.name}". Esta acción no se puede deshacer.</p>
+                        <div className="flex gap-3">
+                            <button onClick={() => setSelectionToDelete(null)} className="flex-1 py-3 text-[#E8DCCF]/60 font-bold hover:text-white">Cancelar</button>
+                            <button onClick={confirmDeleteSelection} className="flex-1 py-3 bg-red-600 text-white rounded-xl font-bold shadow-lg hover:bg-red-700">Eliminar</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+            {showSaveModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowSaveModal(false)}>
+                    <div className="w-full max-w-lg bg-[#2C1B15] rounded-2xl shadow-2xl flex flex-col h-[85vh] border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                        
+                        <div className="flex justify-between items-center p-4 border-b border-[#9E7649]/20 shrink-0 bg-[#1A100C] rounded-t-2xl">
+                            <div>
+                                <h3 className="font-bold text-white">Guardar Selección</h3>
+                                <p className="text-xs text-[#E8DCCF]/60">Edita los detalles antes de guardar</p>
+                            </div>
+                            <button onClick={() => setShowSaveModal(false)}><span className="material-symbols-outlined text-[#E8DCCF]/40 hover:text-white">close</span></button>
+                        </div>
+
+                        <div className="p-4 bg-[#2C1B15] border-b border-[#9E7649]/20 shrink-0 space-y-4">
+                            <div>
+                                <label className="text-xs font-bold text-[#E8DCCF]/60 block mb-1">Nombre de la Selección</label>
+                                <input 
+                                    autoFocus
+                                    className="w-full p-2 border border-[#9E7649]/30 bg-[#1A100C] text-white rounded-lg text-sm outline-none focus:border-[#9E7649]" 
+                                    placeholder="Ej: Programa Lunes..." 
+                                    value={saveName} 
+                                    onChange={e => setSaveName(e.target.value)}
+                                />
+                            </div>
+                            <div className="grid grid-cols-2 gap-4">
+                                <div>
+                                    <label className="text-xs font-bold text-[#E8DCCF]/60 block mb-1">Programa</label>
+                                    <select value={programName} onChange={e => setProgramName(e.target.value)} className="w-full p-2 border border-[#9E7649]/30 rounded bg-[#1A100C] text-white text-sm outline-none focus:border-[#9E7649]">
+                                        {(programs.length > 0 ? programs : DEFAULT_PROGRAMS_LIST).map(p => <option key={p} value={p}>{p}</option>)}
+                                    </select>
+                                </div>
+                                <div>
+                                    <label className="text-xs font-bold text-[#E8DCCF]/60 block mb-1">Fecha</label>
+                                    <input type="date" value={reportDate} onChange={e => setReportDate(e.target.value)} className="w-full p-2 border border-[#9E7649]/30 rounded bg-[#1A100C] text-white text-sm outline-none focus:border-[#9E7649]" />
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                            {exportItems.map((item, idx) => (
+                                <div key={item.id} className="relative p-4 border border-[#9E7649]/20 rounded-xl bg-[#1A100C] shadow-sm">
+                                    <button 
+                                        onClick={() => handleRemoveExportItem(idx)}
+                                        className="absolute top-2 right-2 text-red-500 hover:text-red-400 p-1 rounded-full hover:bg-red-500/10 transition-colors"
+                                        title="Eliminar tema"
+                                    >
+                                        <span className="material-symbols-outlined text-sm">delete</span>
+                                    </button>
+                                    <div className="mb-2">
+                                        <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Título</label>
+                                        <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-sm font-bold outline-none focus:border-[#9E7649]" value={item.title} onChange={e => handleUpdateExportItem(idx, 'title', e.target.value)} />
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3 mb-2">
+                                        <div>
+                                            <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Autor</label>
+                                            <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" value={item.author} onChange={e => handleUpdateExportItem(idx, 'author', e.target.value)} />
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Intérprete</label>
+                                            <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" value={item.performer} onChange={e => handleUpdateExportItem(idx, 'performer', e.target.value)} />
+                                        </div>
+                                    </div>
+                                    <div className="grid grid-cols-2 gap-3">
+                                        <div>
+                                            <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Género</label>
+                                            <select className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" value={item.genre} onChange={e => handleUpdateExportItem(idx, 'genre', e.target.value)}>
+                                                <option value="" className="bg-[#2C1B15]">Seleccionar...</option>
+                                                {GENRES_LIST.map(g => <option key={g} value={g} className="bg-[#2C1B15]">{g}</option>)}
+                                            </select>
+                                        </div>
+                                        <div>
+                                            <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Origen</label>
+                                            <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-[#E8DCCF]/40 text-[10px] outline-none" value={item.path} readOnly />
+                                        </div>
+                                    </div>
+                                </div>
+                            ))}
+                        </div>
+
+                        <div className="p-4 border-t border-[#9E7649]/20 shrink-0 bg-[#1A100C] rounded-b-2xl flex gap-3">
+                            <button onClick={() => setShowSaveModal(false)} className="flex-1 py-3 text-[#E8DCCF]/60 font-bold hover:text-white">Cancelar</button>
+                            <button onClick={confirmSaveSelection} className="flex-1 py-3 bg-green-600 text-white rounded-xl font-bold shadow-lg hover:bg-green-700">Guardar Selección</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showClearConfirm && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowClearConfirm(false)}>
+                    <div className="w-full max-w-sm bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                        <h3 className="font-bold text-lg mb-2 text-white">¿Limpiar selección?</h3>
+                        <p className="text-sm text-[#E8DCCF]/60 mb-6">Se eliminarán todas las pistas de la lista actual. Esta acción no se puede deshacer.</p>
+                        <div className="flex gap-3">
+                            <button onClick={() => setShowClearConfirm(false)} className="flex-1 py-3 text-[#E8DCCF]/60 font-bold hover:text-white">Cancelar</button>
+                            <button onClick={confirmClearSelection} className="flex-1 py-3 bg-red-600 text-white rounded-xl font-bold shadow-lg hover:bg-red-700">Limpiar Todo</button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {showLoadConflictModal && (
+                <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowLoadConflictModal(false)}>
+                    <div className="w-full max-w-sm bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                        <h3 className="font-bold text-lg mb-4 text-white">Selección en curso</h3>
+                        <p className="text-sm text-[#E8DCCF]/60 mb-6">Ya tienes pistas seleccionadas. ¿Qué deseas hacer con la selección guardada?</p>
+                        <div className="flex flex-col gap-3">
+                            <button onClick={handleMergeSelection} className="w-full py-3 bg-[#9E7649] text-white rounded-xl font-bold shadow-lg hover:bg-[#8B653D]">
+                                Integrar (Sumar a la actual)
+                            </button>
+                            <button onClick={handleSaveAndReplaceClick} className="w-full py-3 bg-green-600 text-white rounded-xl font-bold shadow-lg hover:bg-green-700">
+                                Guardar actual y Abrir nueva
+                            </button>
+                            <button onClick={() => { setShowLoadConflictModal(false); setPendingSelectionToLoad(null); }} className="w-full py-3 text-[#E8DCCF]/60 font-bold hover:text-white">
+                                Cancelar
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
+
+            {view === ViewState.SETTINGS && authMode === 'admin' && (
+              <Settings 
+                tracks={tracks} 
+                currentUser={currentUser} 
+                onSaveCMNL={onSaveCMNL}
+                programs={programs}
+                onProgramsChange={(newProgs) => {
+                  setPrograms(newProgs);
+                  localStorage.setItem('rcm_programs_list', JSON.stringify(newProgs));
+                  if (onSaveCMNL) onSaveCMNL();
+                }}
+              />
+            )}
+            {view === ViewState.PRODUCTIONS && authMode === 'admin' && <Productions onUpdateTracks={updateTracks} allTracks={tracks} />}
+            {view === ViewState.REPORTS && authMode === 'director' && <ReportsViewer onEdit={handleEditReport} currentUser={currentUser} users={users} refreshTrigger={reportsRefreshKey} />}
+            {view === ViewState.GUIDE && authMode !== 'admin' && <Guide />}
+        </div>
+
+        {selectedTrack && (
+            <TrackDetail 
+                track={selectedTrack} authMode={authMode} onClose={() => setSelectedTrack(null)} 
+                onSearchCredits={() => {}} 
+                onSaveEdit={handleSaveEdit}
+            />
+        )}
+
+        {showWishlist && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowWishlist(false)}>
+                <div className="w-full max-w-sm bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                    <h3 className="font-bold text-lg mb-1 text-white">Cargar Lista de Reproducción</h3>
+                    <p className="text-[11px] text-[#E8DCCF]/60 mb-3 leading-snug">
+                        Pegue una lista estructurada con Título, Autor, País, Intérprete, País, Género para generar la selección con todas las capacidades nativas.
+                    </p>
+                    <textarea 
+                        className="w-full h-48 p-3 border border-[#9E7649]/30 bg-[#1A100C] text-white rounded-xl text-xs outline-none focus:border-[#9E7649] font-mono leading-relaxed" 
+                        placeholder={`Título: SABROSO CHANGÜÍ\nAutor: Ernesto "El Gato" Gatell\nPaís: Cuba\nIntérprete: Agrupación Changüí Asere\nPaís: Cuba\nGénero: Changüí`} 
+                        value={wishlistText} 
+                        onChange={e => setWishlistText(e.target.value)} 
+                    />
+                    <div className="flex gap-3 mt-4">
+                        <button onClick={() => setShowWishlist(false)} className="flex-1 py-3 text-[#E8DCCF]/60 font-bold hover:text-white transition-colors text-sm">Cerrar</button>
+                        <button onClick={handleProcessWishlist} className="flex-1 py-3 bg-[#9E7649] text-white rounded-xl font-bold shadow-lg hover:bg-[#8B653D] transition-colors text-sm">Cargar</button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {showImportSelectionModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowImportSelectionModal(false)}>
+                <div className="w-full max-w-sm bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                    <h3 className="font-bold text-lg mb-2 text-white">Importar Selección</h3>
+                    <textarea className="w-full h-40 p-3 border border-[#9E7649]/30 bg-[#1A100C] text-white rounded-xl text-sm outline-none focus:border-[#9E7649]" placeholder="Pegue la selección aquí..." value={importSelectionText} onChange={e => setImportSelectionText(e.target.value)} />
+                    <div className="flex gap-3 mt-4">
+                        <button onClick={() => setShowImportSelectionModal(false)} className="flex-1 py-3 text-[#E8DCCF]/60 font-bold hover:text-white">Cerrar</button>
+                        <button onClick={handleProcessImportSelection} className="flex-1 py-3 bg-blue-600 text-white rounded-xl font-bold shadow-lg hover:bg-blue-700">Procesar</button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {activeRootToDownloadPrompt && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in" onClick={() => setActiveRootToDownloadPrompt(null)}>
+                <div className="w-full max-w-sm bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                    <h3 className="font-bold text-lg mb-2 text-white flex items-center gap-2">💾 Base de Datos de Música</h3>
+                    <p className="text-sm text-[#E8DCCF]/80 mb-6 leading-relaxed">
+                        Se han incorporado nuevos datos para la base de datos de <span className="font-bold text-amber-200">{activeRootToDownloadPrompt}</span>. 
+                        Por favor, descargue el archivo oficial para guardarlo en el servidor:
+                    </p>
+                    <div className="bg-[#1A100C] p-3 rounded-xl border border-[#9E7649]/20 text-xs text-[#E8DCCF]/60 mb-6 font-mono break-all text-center">
+                        Archivo: {ROOT_DB_CONFIG[activeRootToDownloadPrompt]?.filename || 'mdatos.json'}
+                    </div>
+                    <div className="flex flex-col gap-3">
+                        <button 
+                            onClick={() => {
+                                handleExportRoot(activeRootToDownloadPrompt);
+                                setActiveRootToDownloadPrompt(null);
+                            }} 
+                            className="w-full py-3 bg-[#9E7649] hover:bg-[#8B653D] text-white rounded-xl font-bold font-sans text-sm shadow-lg flex items-center justify-center gap-2 transition-colors"
+                        >
+                            <span className="material-symbols-outlined text-sm">download</span> Descargar {ROOT_DB_CONFIG[activeRootToDownloadPrompt]?.filename || 'mdatos.json'}
+                        </button>
+                        <button 
+                            onClick={() => setActiveRootToDownloadPrompt(null)} 
+                            className="w-full py-3 text-[#E8DCCF]/60 font-bold hover:text-white text-sm transition-colors text-center"
+                        >
+                            Cerrar
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {whatsAppPromptPayload && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4 animate-fade-in" onClick={() => setWhatsAppPromptPayload(null)}>
+                <div className="w-full max-w-md bg-[#2C1B15] rounded-2xl p-6 shadow-2xl border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                    <h3 className="font-bold text-lg mb-2 text-white flex items-center gap-2">📲 Enviar Sincronización</h3>
+                    <p className="text-sm text-[#E8DCCF]/80 mb-4 leading-relaxed">
+                        Se han guardado localmente nuevos datos de música. Para coordinarlo con la emisora, envíe las modificaciones al administrador:
+                    </p>
+                    <textarea 
+                        className="w-full h-32 p-3 border border-[#9E7649]/30 bg-[#1A100C] text-white rounded-xl text-xs outline-none focus:border-[#9E7649] font-mono leading-relaxed mb-6"
+                        value={whatsAppPromptPayload}
+                        readOnly
+                    />
+                    <div className="flex gap-3">
+                        <button 
+                            onClick={() => setWhatsAppPromptPayload(null)} 
+                            className="flex-1 py-3 text-[#E8DCCF]/60 font-bold hover:text-white text-sm transition-colors"
+                        >
+                            Cancelar
+                        </button>
+                        <a 
+                            href={`https://wa.me/${(() => {
+                                let adminPhone = '54413935'; 
+                                const savedEquipo = localStorage.getItem('rcm_equipo_cmnl');
+                                if (savedEquipo) {
+                                    try {
+                                        const equipo = JSON.parse(savedEquipo);
+                                        if (Array.isArray(equipo)) {
+                                            const adminStatic = equipo.find((m: any) => m.id === 'admin_app_static');
+                                            let designatedUserId = 'pedro';
+                                            if (adminStatic) {
+                                                if (adminStatic.designatedUserId) {
+                                                    designatedUserId = adminStatic.designatedUserId;
+                                                }
+                                                if (adminStatic.mobile) adminPhone = adminStatic.mobile;
+                                                else if (adminStatic.phone) adminPhone = adminStatic.phone;
+                                            }
+                                            const designatedMember = equipo.find((m: any) => m.id === designatedUserId || m.username === designatedUserId);
+                                            if (designatedMember) {
+                                                if (designatedMember.mobile) adminPhone = designatedMember.mobile;
+                                                else if (designatedMember.phone) adminPhone = designatedMember.phone;
+                                            }
+                                        }
+                                    } catch (e) {
+                                        console.error(e);
+                                    }
+                                }
+                                return adminPhone;
+                            })()}?text=${encodeURIComponent(whatsAppPromptPayload)}`}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            onClick={() => setWhatsAppPromptPayload(null)}
+                            className="flex-1 py-3 bg-[#25D366] hover:bg-[#1DA851] text-white rounded-xl font-bold text-center flex items-center justify-center gap-1.5 shadow-lg text-sm transition-colors"
+                        >
+                            <svg className="w-4 h-4 text-white fill-current inline-block" viewBox="0 0 24 24">
+                                <path d="M.057 24l1.687-6.163c-1.041-1.804-1.588-3.849-1.587-5.946C.06 5.348 5.397.01 12.008.01c3.202.001 6.212 1.246 8.477 3.514 2.266 2.268 3.507 5.28 3.505 8.484-.004 6.657-5.34 11.997-11.953 11.997-2.005-.001-3.973-.502-5.73-1.45L0 24zm6.59-4.846c1.6.95 3.1 1.45 4.6 1.45a9.85 9.85 0 0 0 9.85-9.85c.002-5.432-4.417-9.85-9.858-9.85-5.432 0-9.85 4.418-9.852 9.85a9.83 9.83 0 0 0 1.49 5.093l-.99 3.633 3.76-.976zm10.468-4.8c-.29-.145-1.72-.85-1.985-.945-.267-.1-.462-.146-.658.147-.196.29-.757.945-.928 1.14-.171.192-.34.215-.63.072-.29-.145-1.226-.453-2.335-1.44-.864-.772-1.448-1.725-1.618-2.016-.17-.29-.018-.447.127-.59.13-.13.29-.34.435-.51.145-.17.192-.29.29-.48.096-.193.048-.362-.024-.508-.07-.145-.658-1.587-.902-2.174-.236-.57-.478-.492-.656-.5-.17-.008-.367-.01-.564-.01-.197 0-.516.074-.787.368-.27.293-1.03 1.008-1.03 2.455 0 1.448 1.054 2.848 1.202 3.043.148.195 2.078 3.172 5.035 4.45.704.304 1.253.486 1.68.622.71.226 1.354.194 1.864.118a2.76 2.76 0 0 0 1.81-1.27c.264-.54.264-.997.185-1.093-.078-.096-.29-.144-.58-.29z"/>
+                            </svg>
+                            Enviar WhatsApp
+                        </a>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {showExportModal && (
+            <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm p-4" onClick={() => setShowExportModal(false)}>
+                <div className="w-full max-w-lg bg-[#2C1B15] rounded-2xl shadow-2xl flex flex-col h-[85vh] border border-[#9E7649]/30" onClick={e => e.stopPropagation()}>
+                    
+                    <div className="flex justify-between items-center p-4 border-b border-[#9E7649]/20 shrink-0 bg-[#1A100C] rounded-t-2xl">
+                        <div>
+                            <h3 className="font-bold text-white">{editingReportId ? 'Edición PDF' : 'Exportar Selección'}</h3>
+                            <p className="text-xs text-[#E8DCCF]/60">Edita los detalles antes de {editingReportId ? 'actualizar' : 'compartir'}</p>
+                        </div>
+                        <button onClick={() => setShowExportModal(false)}><span className="material-symbols-outlined text-[#E8DCCF]/40 hover:text-white">close</span></button>
+                    </div>
+
+                    <div className="p-4 bg-[#2C1B15] border-b border-[#9E7649]/20 shrink-0 grid grid-cols-2 gap-4">
+                        <div>
+                            <label className="text-xs font-bold text-[#E8DCCF]/60 block mb-1">Programa</label>
+                            <select value={programName} onChange={e => setProgramName(e.target.value)} className="w-full p-2 border border-[#9E7649]/30 rounded bg-[#1A100C] text-white text-sm outline-none focus:border-[#9E7649]">
+                                {(programs.length > 0 ? programs : DEFAULT_PROGRAMS_LIST).map(p => <option key={p} value={p}>{p}</option>)}
+                            </select>
+                        </div>
+                        <div>
+                            <label className="text-xs font-bold text-[#E8DCCF]/60 block mb-1">Fecha</label>
+                            <input type="date" value={reportDate} onChange={e => setReportDate(e.target.value)} className="w-full p-2 border border-[#9E7649]/30 rounded bg-[#1A100C] text-white text-sm outline-none focus:border-[#9E7649]" />
+                        </div>
+                    </div>
+
+                    <div className="flex-1 overflow-y-auto p-4 space-y-4">
+                        <div className="flex justify-end">
+                            <button 
+                                type="button"
+                                onClick={handleAddNewExportItem}
+                                className="flex items-center gap-1.5 px-3 py-1.5 bg-[#9E7649] hover:bg-[#8B653D] text-[#E8DCCF] font-bold text-xs rounded-lg shadow-md transition-all uppercase tracking-wider"
+                            >
+                                <span className="material-symbols-outlined text-xs">add_circle</span>
+                                Incluir tema manual
+                            </button>
+                        </div>
+                        {exportItems.map((item, idx) => (
+                            <div key={item.id} className="relative p-4 border border-[#9E7649]/20 rounded-xl bg-[#1A100C] shadow-sm">
+                                <button 
+                                    onClick={() => handleRemoveExportItem(idx)}
+                                    className="absolute top-2 right-2 text-red-500 hover:text-red-400 p-1 rounded-full hover:bg-red-500/10 transition-colors"
+                                    title="Eliminar tema"
+                                >
+                                    <span className="material-symbols-outlined text-sm">delete</span>
+                                </button>
+                                <div className="mb-2">
+                                    <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Título</label>
+                                    <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-sm font-bold outline-none focus:border-[#9E7649]" value={item.title} onChange={e => handleUpdateExportItem(idx, 'title', e.target.value)} />
+                                </div>
+                                <div className="grid grid-cols-2 gap-3 mb-2">
+                                    <div>
+                                        <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Autor</label>
+                                        <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" value={item.author} onChange={e => handleUpdateExportItem(idx, 'author', e.target.value)} />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">País Autor</label>
+                                        <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" list="country-options" value={item.authorCountry} onChange={e => handleUpdateExportItem(idx, 'authorCountry', e.target.value)} />
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-2 gap-3 mb-2">
+                                    <div>
+                                        <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Intérprete</label>
+                                        <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" value={item.performer} onChange={e => handleUpdateExportItem(idx, 'performer', e.target.value)} />
+                                    </div>
+                                    <div>
+                                        <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">País Intérprete</label>
+                                        <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" list="country-options" value={item.performerCountry} onChange={e => handleUpdateExportItem(idx, 'performerCountry', e.target.value)} />
+                                    </div>
+                                </div>
+                                <div>
+                                    <label className="text-[10px] font-bold text-[#E8DCCF]/60 uppercase">Género</label>
+                                    <input className="w-full p-1 border-b border-[#9E7649]/30 bg-transparent text-white text-xs outline-none focus:border-[#9E7649]" list="genre-options" value={item.genre} onChange={e => handleUpdateExportItem(idx, 'genre', e.target.value)} />
+                                </div>
+                            </div>
+                        ))}
+                    </div>
+
+                    <div className="p-4 grid grid-cols-2 gap-3 bg-[#1A100C] border-t border-[#9E7649]/20 rounded-b-2xl shrink-0">
+                        {editingReportId ? (
+                            <>
+                                <button onClick={() => setShowExportModal(false)} className="bg-[#2C1B15] text-[#E8DCCF]/60 py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 hover:text-white">
+                                    Cancelar
+                                </button>
+                                <button onClick={handleDownloadReport} className="bg-[#9E7649] hover:bg-[#8B653D] text-white py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm">
+                                    <i className="material-symbols-outlined text-lg">save</i> Actualizar pdf
+                                </button>
+                            </>
+                        ) : (
+                            <>
+                                <button onClick={handleShareWhatsApp} className={`bg-[#25D366] hover:bg-[#1DA851] text-white py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm ${authMode !== 'director' ? 'col-span-2' : ''}`}>
+                                    <i className="material-symbols-outlined text-lg">chat</i> WhatsApp
+                                </button>
+                                {authMode === 'director' && (
+                                    <button onClick={handleDownloadReport} className="bg-[#9E7649] hover:bg-[#8B653D] text-white py-3 rounded-xl font-bold text-xs flex items-center justify-center gap-2 shadow-sm">
+                                        <i className="material-symbols-outlined text-lg">picture_as_pdf</i> Generar PDF
+                                    </button>
+                                )}
+                            </>
+                        )}
+                    </div>
+                </div>
+            </div>
+        )}
+
+        {isUpdating && (
+            <div className="absolute inset-0 z-[100] bg-black/60 backdrop-blur-[2px] flex items-center justify-center">
+                <div className="bg-[#2C1B15] border border-[#9E7649]/30 p-6 rounded-2xl shadow-2xl flex flex-col items-center gap-3 animate-fade-in">
+                    <div className="relative size-12">
+                        <svg className="animate-spin size-12 text-[#E8DCCF]/20" viewBox="0 0 24 24"></svg> 
+                        <div className="absolute inset-0 border-4 border-[#9E7649] border-t-transparent rounded-full animate-spin"></div>
+                    </div>
+                    <div className="text-center">
+                        <h4 className="font-bold text-white">Actualizando</h4>
+                        <p className="text-xs text-[#E8DCCF]/60">Por favor espere...</p>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        <nav className="bg-[#2C1B15] border-t border-[#9E7649]/20 h-20 px-4 flex items-center justify-between pb-2 z-20 shrink-0">
+            <NavButton icon="folder_open" label="Explorar" active={view === ViewState.LIST} onClick={() => navigateTo(ViewState.LIST)} />
+            <NavButton icon="checklist" label="Selección" active={view === ViewState.SELECTION} onClick={() => navigateTo(ViewState.SELECTION)} />
+            {authMode === 'director' && <NavButton icon="description" label="Reportes" active={view === ViewState.REPORTS} onClick={() => navigateTo(ViewState.REPORTS)} />}
+            {authMode === 'admin' && <NavButton icon="playlist_add" label="Producción" active={view === ViewState.PRODUCTIONS} onClick={() => navigateTo(ViewState.PRODUCTIONS)} />}
+            {authMode === 'admin' && <NavButton icon="settings" label="Ajustes" active={view === ViewState.SETTINGS} onClick={() => navigateTo(ViewState.SETTINGS)} />}
+            {authMode !== 'admin' && <NavButton icon="help" label="Guía" active={view === ViewState.GUIDE} onClick={() => navigateTo(ViewState.GUIDE)} />}
+        </nav>
+    </div>
+  );
+};
+
+const NavButton: React.FC<{ icon: string, label: string, active: boolean, onClick: () => void }> = ({ icon, label, active, onClick }) => (
+    <button onClick={onClick} className={`flex-1 flex flex-col items-center justify-center transition-all ${active ? 'text-[#9E7649]' : 'text-[#E8DCCF]/40 hover:text-[#E8DCCF]/80'}`}>
+        <span className={`material-symbols-outlined text-2xl ${active ? 'material-symbols-filled' : ''}`}>{icon}</span>
+        <span className="text-[9px] font-bold uppercase mt-1">{label}</span>
+    </button>
+);
+
+export default MusicaApp;

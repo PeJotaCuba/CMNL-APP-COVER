@@ -1,0 +1,1342 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { AppView, User, NewsItem } from './types';
+import PublicLanding from './components/PublicLanding';
+import ListenerHome from './components/ListenerHome';
+import WorkerHome from './components/WorkerHome';
+import AdminDashboard from './components/AdminDashboard';
+import EquipoSection from './components/gestion/EquipoSection';
+import GestionApp from './components/GestionApp';
+import GuionesApp, { PROGRAMS } from './components/GuionesApp';
+import AgendaApp from './components/agenda/AgendaApp';
+import MusicaApp from './components/MusicaApp';
+import ToolsSection from './components/ToolsSection';
+import { Reports } from './src/pages/Reports';
+import HistoryEvolutionView from './src/components/HistoryEvolutionView';
+import Sidebar from './components/Sidebar';
+import QuienesSomos from './components/QuienesSomos';
+import { PlaceholderView, CMNLAppView } from './components/GenericViews';
+import InstallPWA from './components/InstallPWA';
+import { INITIAL_USERS, INITIAL_NEWS, INITIAL_HISTORY, INITIAL_ABOUT, getCurrentProgram, getCategoryVector } from './utils/scheduleData';
+import BackupDialog from './components/BackupDialog';
+import { UpdateDetailsModal } from './components/UpdateDialogs';
+import { loadReportsFromDB, loadProductionsFromDB, loadSelectionsFromDB, loadSavedSelectionsListFromDB } from './components/musica/services/db';
+import { Play, Pause, SkipBack, SkipForward, RefreshCw, BookOpen, X } from 'lucide-react';
+import { RADIAL_TERMS_BASE } from './components/radialTermsBase';
+import { motion, AnimatePresence } from 'motion/react';
+
+import { ConvexClientProvider } from './src/contexts/ConvexClientProvider';
+import { useQuery, useMutation } from 'convex/react';
+import { api } from './convex/_generated/api';
+import { sanitizeKeys, desanitizeKeys } from './utils/convexSanitizer';
+
+const App: React.FC = () => {
+  return (
+    <ConvexClientProvider>
+      <AppContent />
+    </ConvexClientProvider>
+  );
+};
+
+const AppContent: React.FC = () => {
+  const [currentView, setCurrentView] = useState<AppView>(() => {
+    const sessionRole = localStorage.getItem('rcm_user_session');
+    const sessionUsername = localStorage.getItem('rcm_user_username');
+    const savedView = localStorage.getItem('rcm_current_view') as AppView | null;
+
+    if (sessionRole && sessionUsername) {
+      if (savedView && Object.values(AppView).includes(savedView) && savedView !== AppView.LANDING) {
+        return savedView;
+      }
+      if (sessionRole === 'admin') {
+        return AppView.ADMIN_DASHBOARD;
+      } else if (sessionRole === 'worker' || sessionRole === 'coordinator') {
+        return AppView.WORKER_HOME;
+      }
+    }
+
+    if (savedView === AppView.LANDING) {
+      return AppView.LANDING;
+    }
+    return AppView.LISTENER_HOME;
+  });
+  const [history, setHistory] = useState<AppView[]>([]);
+  const [isDirty, setIsDirty] = useState(false);
+  const [showBackupDialog, setShowBackupDialog] = useState(false);
+  const [isLogoutTrigger, setIsLogoutTrigger] = useState(false);
+  const pendingNavigation = useRef<(() => void) | null>(null);
+
+  const checkDirty = (callback: () => void, isLogout = false) => {
+      // Check if user should see the backup prompt
+      const classification = (currentUser?.classification || '').toLowerCase();
+      const role = (currentUser?.role || '').toLowerCase();
+      
+      const isExcluded = classification === 'administrador' || classification === 'coordinador' || role === 'admin' || role === 'coordinator';
+      
+      const activeRoles = [
+          'director', 'asesor', 'realizador', 'locutor', 'guionista', 
+          'periodista', 'coordinador', 'director de emisora', 'jefe de programación', 
+          'especialista', 'auxiliar general', 'asistente de dirección', 'recepcionista'
+      ];
+      const isActiveRole = activeRoles.some(role => classification.includes(role));
+      
+      const isSensitiveView = currentView === AppView.APP_MUSICA || currentView === AppView.APP_PROGRAMACION || currentView === AppView.APP_EQUIPO;
+
+      // Check if backup is snoozed
+      let isSnoozed = false;
+      if (currentUser) {
+          const snoozedUntilStr = localStorage.getItem(`backup_snoozed_until_${currentUser.username}`);
+          if (snoozedUntilStr) {
+              const snoozedUntil = parseInt(snoozedUntilStr, 10);
+              if (Date.now() < snoozedUntil) {
+                  isSnoozed = true;
+              }
+          }
+      }
+
+      // Trigger if dirty, in sensitive view, or logging out, AND NOT SNOOZED
+      if ((isDirty || isSensitiveView || isLogout) && !isExcluded && isActiveRole && !isSnoozed) {
+          pendingNavigation.current = callback;
+          setIsLogoutTrigger(isLogout);
+          setShowBackupDialog(true);
+      } else {
+          callback();
+      }
+  };
+
+  const handleBackup = async () => {
+      if (currentUser) {
+          // Collect all data
+          const username = currentUser.username;
+          
+          // 1. Payments Data (LocalStorage)
+          const paymentsData = {
+              worklogs: JSON.parse(localStorage.getItem(`user_${username}_rcm_data_worklogs`) || '[]'),
+              consolidated: JSON.parse(localStorage.getItem(`user_${username}_rcm_data_consolidated`) || '[]'),
+              interruptions: JSON.parse(localStorage.getItem(`user_${username}_rcm_interruptions`) || '[]'),
+              consolidatedMonths: JSON.parse(localStorage.getItem(`user_${username}_rcm_consolidated_months`) || '[]'),
+              habitualExclusions: JSON.parse(localStorage.getItem(`user_${username}_habitual_exclusions`) || '[]'),
+              habitualMode: localStorage.getItem(`user_${username}_habitual_mode`) === 'true',
+          };
+
+          // 2. Music Data (IndexedDB + LocalStorage)
+          const [reports, productions, selections, savedSelectionsList] = await Promise.all([
+              loadReportsFromDB(username),
+              loadProductionsFromDB(), // These might need filtering by user if they have a field
+              loadSelectionsFromDB(),
+              loadSavedSelectionsListFromDB()
+          ]);
+
+          const musicData = {
+              currentSelection: JSON.parse(localStorage.getItem(`user_${username}_rcm_current_selection`) || '[]'),
+              savedSelections: JSON.parse(localStorage.getItem(`user_${username}_rcm_saved_selections`) || '[]'),
+              reports: reports,
+              productions: productions.filter((p: any) => p.createdBy === username || !p.createdBy),
+              selections: selections,
+              savedSelectionsList: savedSelectionsList
+          };
+
+          // 3. Guiones Data (LocalStorage)
+          const guionesData: Record<string, any> = {};
+          for (let i = 0; i < localStorage.length; i++) {
+              const key = localStorage.key(i);
+              if (key && key.startsWith('guionbd_data_')) {
+                  guionesData[key] = JSON.parse(localStorage.getItem(key) || '[]');
+              }
+          }
+
+          // 4. Agenda Data (LocalStorage)
+          const agendaData = {
+              programs: JSON.parse(localStorage.getItem('rcm_programs') || '[]'),
+              efemerides: JSON.parse(localStorage.getItem('rcm_efemerides') || '{}'),
+              conmemoraciones: JSON.parse(localStorage.getItem('rcm_conmemoraciones') || '{}'),
+              dayThemes: JSON.parse(localStorage.getItem('rcm_day_themes') || '{}'),
+              propaganda: JSON.parse(localStorage.getItem('rcm_propaganda') || '{}'),
+              culturalOptions: JSON.parse(localStorage.getItem('rcm_cultural_options') || '{}'),
+              users: JSON.parse(localStorage.getItem('rcm_users') || '[]'),
+          };
+
+          const backupData = {
+              username: username,
+              name: currentUser.name,
+              classification: currentUser.classification,
+              timestamp: new Date().toISOString(),
+              version: "1.0",
+              data: {
+                  payments: paymentsData,
+                  music: musicData,
+                  guiones: guionesData,
+                  agenda: agendaData
+              }
+          };
+
+          const dataStr = JSON.stringify(backupData, null, 2);
+          const blob = new Blob([dataStr], { type: "application/json" });
+          const url = URL.createObjectURL(blob);
+          const link = document.createElement('a');
+          link.href = url;
+          const now = new Date();
+          const year = now.getFullYear();
+          const month = String(now.getMonth() + 1).padStart(2, '0');
+          const day = String(now.getDate()).padStart(2, '0');
+          const hours = String(now.getHours()).padStart(2, '0');
+          const minutes = String(now.getMinutes()).padStart(2, '0');
+          const dateStr = `${year}-${month}-${day}`;
+          const timeStr = `${hours}-${minutes}`;
+          
+          link.download = `Respaldo_${username}_${dateStr}_${timeStr}.json`;
+          document.body.appendChild(link);
+          link.click();
+          document.body.removeChild(link);
+          URL.revokeObjectURL(url);
+
+          // Update last backup timestamp
+          localStorage.setItem(`last_backup_${username}`, new Date().getTime().toString());
+
+          // Automatically snooze the reminder for 24 hours, or keep existing snooze if it's longer
+          const existingSnoozeStr = localStorage.getItem(`backup_snoozed_until_${username}`);
+          const previousSnooze = existingSnoozeStr ? parseInt(existingSnoozeStr, 10) : 0;
+          const twentyFourHoursFromNow = Date.now() + 24 * 60 * 60 * 1000;
+          const newSnooze = Math.max(previousSnooze, twentyFourHoursFromNow);
+          localStorage.setItem(`backup_snoozed_until_${username}`, newSnooze.toString());
+      }
+
+      setIsDirty(false);
+      setShowBackupDialog(false);
+      if (pendingNavigation.current) {
+          pendingNavigation.current();
+          pendingNavigation.current = null;
+      }
+  };
+  
+  // Global Data State - Initialized from LocalStorage or JSON via utils
+  const [users, setUsers] = useState<User[]>(() => {
+    const saved = localStorage.getItem('rcm_data_users');
+    let parsedUsers: User[] = saved ? JSON.parse(saved) : INITIAL_USERS;
+    
+    // Security Patch: Ensure only Administrador and Coordinador have elevated roles
+    let modified = false;
+    parsedUsers = parsedUsers.map(u => {
+      if (u.role === 'admin' && u.classification !== 'Administrador') {
+        modified = true;
+        return { ...u, role: 'worker' };
+      }
+      if (u.classification === 'Coordinador' && u.role !== 'coordinator') {
+          modified = true;
+          return { ...u, role: 'coordinator' };
+      }
+      return u;
+    });
+    
+    if (modified) {
+      localStorage.setItem('rcm_data_users', JSON.stringify(parsedUsers));
+    }
+    
+    return parsedUsers;
+  });
+  
+  const [news, setNews] = useState<NewsItem[]>(() => {
+    const saved = localStorage.getItem('rcm_data_news');
+    console.log('Loaded news from localStorage:', saved ? JSON.parse(saved).length : 0);
+    return saved ? JSON.parse(saved) : INITIAL_NEWS;
+  });
+
+  const [historyContent, setHistoryContent] = useState<string>(() => {
+    const saved = localStorage.getItem('rcm_data_history');
+    return saved || INITIAL_HISTORY;
+  });
+
+  const [aboutContent, setAboutContent] = useState<string>(() => {
+    const saved = localStorage.getItem('rcm_data_about');
+    return saved || INITIAL_ABOUT;
+  });
+
+  const [equipoData, setEquipoData] = useState<any[]>(() => {
+    const saved = localStorage.getItem('rcm_equipo_cmnl');
+    return saved ? JSON.parse(saved) : [];
+  });
+
+  const [selectedNews, setSelectedNews] = useState<NewsItem | null>(null);
+  
+  // Convex Real-Time Synchronization Engine
+  const allConvexStationData = useQuery(api.stationData.getAllStationData);
+  const updateStationDataMutation = useMutation(api.stationData.updateStationData);
+
+  // Wrapped State Setters to ensure any local setter call automatically updates localStorage
+  const setUsersAndSync = (newVal: User[] | ((prev: User[]) => User[])) => {
+    setUsers(prev => {
+      const resolved = typeof newVal === 'function' ? newVal(prev) : newVal;
+      localStorage.setItem('rcm_data_users', JSON.stringify(resolved));
+      return resolved;
+    });
+  };
+
+  const setNewsAndSync = (newVal: NewsItem[] | ((prev: NewsItem[]) => NewsItem[])) => {
+    setNews(prev => {
+      const resolved = typeof newVal === 'function' ? newVal(prev) : newVal;
+      localStorage.setItem('rcm_data_news', JSON.stringify(resolved));
+      return resolved;
+    });
+  };
+
+  const setHistoryContentAndSync = (newVal: string | ((prev: string) => string)) => {
+    setHistoryContent(prev => {
+      const resolved = typeof newVal === 'function' ? newVal(prev) : newVal;
+      localStorage.setItem('rcm_data_history', resolved);
+      return resolved;
+    });
+  };
+
+  const setAboutContentAndSync = (newVal: string | ((prev: string) => string)) => {
+    setAboutContent(prev => {
+      const resolved = typeof newVal === 'function' ? newVal(prev) : newVal;
+      localStorage.setItem('rcm_data_about', resolved);
+      return resolved;
+    });
+  };
+
+  // Intercept all manual localStorage.setItem calls and sync to Convex in real-time
+  useEffect(() => {
+    const originalSetItem = localStorage.setItem;
+    
+    localStorage.setItem = function(key, value) {
+      originalSetItem.apply(this, [key, value]);
+      
+      const syncKeys = [
+        'rcm_data_users', 'rcm_data_news', 'rcm_data_history', 'rcm_data_about',
+        'rcm_data_fichas', 'rcm_data_catalogo', 'rcm_equipo_cmnl', 'rcm_programs',
+        'rcm_efemerides', 'rcm_conmemoraciones', 'rcm_day_themes', 'rcm_users',
+        'rcm_propaganda', 'rcm_cultural_options', 'rcm_programs_list',
+        'rcm_custom_roots', 'rcm_manual_programming', 'cmnl_digital_signatures',
+        'rcm_gestion_reportes', 'rcm_all_consolidated_payments',
+        'rcm_diccionario_radial', 'rcm_tools_order', 'rcm_whatsapp_group_url',
+        'rcm_floating_tools', 'rcm_transmission_config', 'rcm_transmission_interruptions',
+        'rcm_transmission_historical', 'rcm_payment_config', 'rcm_payment_workers',
+        'rcm_payment_programs', 'rcm_payment_roles', 'rcm_payment_history',
+        'rcm_scripts_programs', 'rcm_scripts_history', 'rcm_program_sections',
+        'music_productions', 'music_tracks'
+      ];
+      
+      if (syncKeys.some(sk => key === sk || key.startsWith('user_') || key.startsWith('guionbd_data_') || key.startsWith('program_sections_'))) {
+        let parsedVal = value;
+        try { parsedVal = JSON.parse(value); } catch(e) {}
+        
+        const cleanVal = sanitizeKeys(parsedVal);
+        
+        updateStationDataMutation({
+          key: key,
+          data: cleanVal,
+          updatedBy: localStorage.getItem('rcm_user_username') || 'system'
+        }).catch(err => {
+          console.error("Failed to sync key to Convex:", key, err);
+        });
+      }
+    };
+    
+    return () => {
+      localStorage.setItem = originalSetItem;
+    };
+  }, [updateStationDataMutation]);
+
+  // Handle incoming real-time updates from Convex and apply them reactively to states & localStorage
+  useEffect(() => {
+    if (!allConvexStationData) return;
+    
+    allConvexStationData.forEach(item => {
+      const { key, data } = item;
+      const desanitizedData = desanitizeKeys(data);
+      const localValue = localStorage.getItem(key);
+      const stringifiedRemote = JSON.stringify(desanitizedData);
+      
+      if (localValue !== stringifiedRemote) {
+        localStorage.setItem(key, stringifiedRemote);
+        
+        if (key === 'rcm_data_users') {
+          setUsers(desanitizedData);
+        } else if (key === 'rcm_data_news') {
+          setNews(desanitizedData);
+        } else if (key === 'rcm_data_history') {
+          setHistoryContent(desanitizedData);
+        } else if (key === 'rcm_data_about') {
+          setAboutContent(desanitizedData);
+        } else if (key === 'rcm_equipo_cmnl') {
+          setEquipoData(desanitizedData);
+        }
+        
+        window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data: desanitizedData } }));
+      }
+    });
+  }, [allConvexStationData]);
+
+  // Auth State
+  const [currentUser, setCurrentUser] = useState<User | null>(() => {
+    const sessionRole = localStorage.getItem('rcm_user_session');
+    const sessionUsername = localStorage.getItem('rcm_user_username');
+    if (sessionRole && sessionUsername) {
+      const saved = localStorage.getItem('rcm_data_users');
+      const latestUsers: User[] = saved ? JSON.parse(saved) : INITIAL_USERS;
+      let user = latestUsers.find(u => u.username === sessionUsername);
+      if (!user && sessionUsername === 'admincmnl') {
+        const savedEquipo = localStorage.getItem('rcm_equipo_cmnl');
+        let designatedUserId = 'pedro';
+        if (savedEquipo) {
+          try {
+            const parsed = JSON.parse(savedEquipo);
+            if (Array.isArray(parsed)) {
+              const adminMember = parsed.find((m: any) => m.id === 'admin_app_static');
+              if (adminMember && adminMember.designatedUserId) {
+                designatedUserId = adminMember.designatedUserId;
+              }
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        }
+        const linkedUser = latestUsers.find(u => u.id === designatedUserId);
+        user = {
+          id: 'admin_app_static',
+          username: 'admincmnl',
+          name: 'Administrador Global',
+          mobile: '',
+          password: 'RCBay010206',
+          role: 'admin',
+          classification: 'Administrador',
+          deviceLimitEnabled: false,
+          authorizedDevices: linkedUser ? linkedUser.authorizedDevices : []
+        };
+      }
+      return user || null;
+    }
+    return null;
+  });
+
+  // Player State
+  const [isPlaying, setIsPlaying] = useState(false);
+  const [isRefreshing, setIsRefreshing] = useState(false);
+  const [isSidebarOpen, setIsSidebarOpen] = useState(false);
+  const [confirmAction, setConfirmAction] = useState<{ title: string; message: string; onConfirm: () => void } | null>(null);
+  const [impersonatedUser, setImpersonatedUser] = useState<any | null>(null);
+  const audioRef = useRef<HTMLAudioElement>(null);
+  const [currentProgram, setCurrentProgram] = useState({ name: "Cargando...", time: "", image: "" });
+
+  const [updateDetails, setUpdateDetails] = useState<{ show: boolean; content: string } | null>(null);
+
+  const [sabiasEstoTerm, setSabiasEstoTerm] = useState<any | null>(null);
+
+  // Check for daily "¿Sabías esto?" pop-up on mount (first time in 24 hours)
+  useEffect(() => {
+    const lastShow = localStorage.getItem('rcm_sabias_esto_last_show');
+    const now = Date.now();
+    const twentyFourHours = 24 * 60 * 60 * 1000;
+
+    if (!lastShow || (now - parseInt(lastShow, 10)) > twentyFourHours) {
+      let terms = RADIAL_TERMS_BASE;
+      const saved = localStorage.getItem('rcm_diccionario_radial');
+      if (saved) {
+        try {
+          const parsed = JSON.parse(saved);
+          if (Array.isArray(parsed) && parsed.length > 0) {
+            terms = parsed;
+          }
+        } catch (e) {
+          console.error("Error parsing dictionary terms for daily popup:", e);
+        }
+      }
+
+      if (terms && terms.length > 0) {
+        const randomIndex = Math.floor(Math.random() * terms.length);
+        const chosen = terms[randomIndex];
+        setSabiasEstoTerm(chosen);
+      }
+    }
+  }, []);
+
+  useEffect(() => {
+    setCurrentProgram(getCurrentProgram());
+  }, []);
+
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setCurrentProgram(getCurrentProgram());
+  }, []);
+
+  // 48-Hour Backup Reminder Effect
+  useEffect(() => {
+    if (currentUser) {
+      const isExcluded = currentUser.classification === 'Administrador' || currentUser.classification === 'Coordinador' || currentUser.role === 'admin' || currentUser.role === 'coordinator';
+      const classificationLower = (currentUser.classification || '').toLowerCase();
+      const isActiveRole = ['director', 'asesor', 'realizador', 'locutor', 'guionista', 'periodista', 'coordinador', 'director de emisora', 'jefe de programación', 'especialista', 'auxiliar general', 'asistente de dirección', 'recepcionista'].some(role => classificationLower.includes(role));
+      
+      if (!isExcluded && isActiveRole) {
+        const lastBackup = localStorage.getItem(`last_backup_${currentUser.username}`);
+        const now = new Date().getTime();
+        const fortyEightHours = 48 * 60 * 60 * 1000;
+
+        if (!lastBackup || (now - parseInt(lastBackup)) > fortyEightHours) {
+          // If 48h passed, mark as dirty to trigger prompt on next navigation or logout
+          setIsDirty(true);
+        }
+      }
+    }
+  }, [currentUser]);
+
+  // Persistence Effects
+  useEffect(() => { localStorage.setItem('rcm_data_users', JSON.stringify(users)); }, [users]);
+  useEffect(() => { localStorage.setItem('rcm_data_news', JSON.stringify(news)); }, [news]);
+  useEffect(() => { localStorage.setItem('rcm_data_history', historyContent); }, [historyContent]);
+  useEffect(() => { localStorage.setItem('rcm_data_about', aboutContent); }, [aboutContent]);
+  useEffect(() => {
+    if (currentView) {
+      localStorage.setItem('rcm_current_view', currentView);
+    }
+  }, [currentView]);
+
+  useEffect(() => {
+    // Check for persistent session
+    const sessionRole = localStorage.getItem('rcm_user_session');
+    const sessionUsername = localStorage.getItem('rcm_user_username');
+    const savedView = localStorage.getItem('rcm_current_view') as AppView | null;
+
+    if (sessionRole && sessionUsername) {
+      let user = users.find(u => u.username === sessionUsername);
+      if (!user && sessionUsername === 'admincmnl') {
+        const savedEquipo = localStorage.getItem('rcm_equipo_cmnl');
+        let designatedUserId = 'pedro';
+        if (savedEquipo) {
+          try {
+            const parsed = JSON.parse(savedEquipo);
+            if (Array.isArray(parsed)) {
+              const adminMember = parsed.find((m: any) => m.id === 'admin_app_static');
+              if (adminMember && adminMember.designatedUserId) {
+                designatedUserId = adminMember.designatedUserId;
+              }
+            }
+          } catch (e) {
+            console.error(e);
+          }
+        }
+        const linkedUser = users.find(u => u.id === designatedUserId);
+        user = {
+          id: 'admin_app_static',
+          username: 'admincmnl',
+          name: 'Administrador Global',
+          mobile: '',
+          password: 'RCBay010206',
+          role: 'admin',
+          classification: 'Administrador',
+          deviceLimitEnabled: false,
+          authorizedDevices: linkedUser ? linkedUser.authorizedDevices : []
+        };
+      }
+
+      if (user) {
+        setCurrentUser(user);
+        if (savedView && Object.values(AppView).includes(savedView) && savedView !== AppView.LANDING) {
+          setCurrentView(savedView);
+        } else {
+          if (sessionRole === 'admin') {
+            setCurrentView(AppView.ADMIN_DASHBOARD);
+          } else if (sessionRole === 'worker' || sessionRole === 'coordinator') {
+            setCurrentView(AppView.WORKER_HOME);
+          }
+        }
+      } else {
+        // User data missing, fallback
+        setCurrentView(AppView.LISTENER_HOME);
+      }
+    } else {
+       if (savedView === AppView.LANDING) {
+         setCurrentView(AppView.LANDING);
+       } else {
+         setCurrentView(AppView.LISTENER_HOME);
+       }
+    }
+  }, []);
+
+  // Sincronizar currentUser con la lista de usuarios para mantener credenciales y control de dispositivos actualizados en tiempo real
+  useEffect(() => {
+    if (currentUser) {
+      const freshUser = users.find(u => u.id === currentUser.id || u.username === currentUser.username);
+      if (freshUser) {
+        if (JSON.stringify(freshUser) !== JSON.stringify(currentUser)) {
+          setCurrentUser(freshUser);
+        }
+      }
+    }
+  }, [users, currentUser]);
+
+  // Update Program Info for Player
+  useEffect(() => {
+    const interval = setInterval(() => {
+      setCurrentProgram(getCurrentProgram());
+    }, 60000);
+    return () => clearInterval(interval);
+  }, []);
+
+  // Back Button Logic
+  useEffect(() => {
+    const handlePopState = (event: PopStateEvent) => {
+      // If in AgendaApp, GestionApp, or GuionesApp and navigating internally (hash exists), ignore this event
+      // to prevent App.tsx from unmounting the app
+      if ((currentView === AppView.APP_AGENDA || currentView === AppView.APP_PROGRAMACION || currentView === AppView.APP_GUIONES) && 
+          window.location.hash.length > 1) {
+        return;
+      }
+
+      if (history.length > 0) {
+        const prevView = history[history.length - 1];
+        setHistory((prev) => prev.slice(0, -1));
+        setCurrentView(prevView);
+      } else {
+        const sessionRole = localStorage.getItem('rcm_user_session');
+        if (sessionRole && currentView !== AppView.LISTENER_HOME) {
+           window.history.pushState(null, '', window.location.pathname);
+        }
+      }
+    };
+
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, [history, currentView]);
+
+  const handleNavigate = (view: AppView, data?: any) => {
+    console.log('Navigating to:', view, 'Data:', data);
+    if (view === currentView) return;
+    checkDirty(() => {
+        window.history.pushState(null, '', window.location.pathname);
+        setHistory((prev) => [...prev, currentView]);
+        setCurrentView(view);
+        if (view === AppView.SECTION_NEWS_DETAIL && data) {
+          console.log('Setting selectedNews:', data);
+          setSelectedNews(data);
+        }
+    });
+  };
+
+  const handleBack = () => {
+    checkDirty(() => {
+        window.history.replaceState(null, '', window.location.pathname);
+        if (history.length > 0) {
+          const prevView = history[history.length - 1];
+          setHistory((prev) => prev.slice(0, -1));
+          setCurrentView(prevView);
+        } else {
+          const sessionRole = localStorage.getItem('rcm_user_session');
+          if (sessionRole === 'admin') {
+            setCurrentView(AppView.ADMIN_DASHBOARD);
+          } else if (sessionRole === 'worker') {
+            setCurrentView(AppView.WORKER_HOME);
+          } else {
+            setCurrentView(AppView.LISTENER_HOME);
+          }
+        }
+    });
+  };
+
+  const handleLogout = () => {
+    checkDirty(() => {
+        // 1. Clear session
+        localStorage.removeItem('rcm_user_session');
+        localStorage.removeItem('rcm_user_username');
+        localStorage.removeItem('rcm_current_view');
+        setCurrentUser(null);
+        
+        // 2. Stop Player
+        if (audioRef.current) {
+          audioRef.current.pause();
+        }
+        setIsPlaying(false);
+
+        // 3. Redirect
+        setHistory([]);
+        setCurrentView(AppView.LANDING); // Redirect to login
+    }, true);
+  };
+
+  const togglePlay = () => {
+    if (audioRef.current) {
+      if (isPlaying) {
+        audioRef.current.pause();
+      } else {
+        audioRef.current.play();
+      }
+      setIsPlaying(!isPlaying);
+    }
+  };
+
+  const handleRefreshLive = () => {
+      if (audioRef.current) {
+          setIsRefreshing(true);
+          const baseSrc = "https://icecast.teveo.cu/KR43FF7C";
+          // Add a cache buster param to force a fresh connection to the stream
+          const freshSrc = `${baseSrc}?t=${Date.now()}`;
+          
+          audioRef.current.pause();
+          
+          // Re-assign and play
+          audioRef.current.src = freshSrc;
+          audioRef.current.load();
+          audioRef.current.play().then(() => {
+              setIsPlaying(true);
+              setIsRefreshing(false);
+          }).catch(err => {
+              console.error("Playback error during refresh:", err);
+              // Fallback to original src if cache buster fails
+              if (audioRef.current) {
+                  audioRef.current.src = baseSrc;
+                  audioRef.current.load();
+                  audioRef.current.play().catch(() => {});
+              }
+              setIsRefreshing(false);
+          });
+      }
+  };
+
+  const handleAdminBackup = () => {
+      const dataToExport: Record<string, any> = {};
+      
+      const getLocal = (key: string) => {
+          const val = localStorage.getItem(key);
+          if (!val) return undefined;
+          try { return JSON.parse(val); } catch (e) { return val; }
+      };
+
+      // Map local keys to the structure expected by handleCloudSync or from live states
+      dataToExport.users = users;
+      dataToExport.historyContent = getLocal('rcm_data_history') || "";
+      dataToExport.aboutContent = getLocal('rcm_data_about') || "";
+      dataToExport.news = getLocal('rcm_data_news') || [];
+      dataToExport.fichas = getLocal('rcm_data_fichas') || [];
+      dataToExport.catalogo = getLocal('rcm_data_catalogo') || [];
+      
+      // Collect all data for all users
+      const allInterruptions: any[] = [];
+      const allWorklogs: any[] = [];
+      const allConsolidated: any[] = [];
+      const allConsolidatedMonths: any[] = [];
+      const allHabitualExclusions: any[] = [];
+      const allHabitualModes: any[] = [];
+      
+      users.forEach(user => {
+          const u = user.username;
+          const userWorklogs = getLocal(`user_${u}_rcm_data_worklogs`);
+          const userConsolidated = getLocal(`user_${u}_rcm_data_consolidated`);
+          const userInterruptions = getLocal(`user_${u}_rcm_interruptions`);
+          const userConsolidatedMonths = getLocal(`user_${u}_rcm_consolidated_months`);
+          const userHabitualExclusions = getLocal(`user_${u}_habitual_exclusions`);
+          const userHabitualMode = getLocal(`user_${u}_habitual_mode`);
+          
+          if (Array.isArray(userWorklogs)) allWorklogs.push(...userWorklogs);
+          if (Array.isArray(userConsolidated)) allConsolidated.push(...userConsolidated);
+          if (Array.isArray(userInterruptions)) allInterruptions.push(...userInterruptions);
+          if (Array.isArray(userConsolidatedMonths)) allConsolidatedMonths.push(...userConsolidatedMonths);
+          if (Array.isArray(userHabitualExclusions)) allHabitualExclusions.push({ username: u, exclusions: userHabitualExclusions });
+          if (userHabitualMode !== undefined) allHabitualModes.push({ username: u, mode: userHabitualMode });
+      });
+      
+      dataToExport.worklogs = allWorklogs;
+      dataToExport.consolidated = allConsolidated;
+      dataToExport.interruptions = allInterruptions;
+      dataToExport.consolidatedMonths = allConsolidatedMonths;
+      dataToExport.habitualExclusions = allHabitualExclusions;
+      dataToExport.habitualModes = allHabitualModes;
+      
+      dataToExport.transmissionConfig = getLocal('rcm_transmission_config');
+      dataToExport.transmissionInterruptions = getLocal('rcm_transmission_interruptions') || [];
+      dataToExport.transmissionHistorical = getLocal('rcm_transmission_historical') || [];
+      
+      // Payment configs
+      dataToExport.paymentConfigs = {
+          rcm_payment_config: getLocal('rcm_payment_config'),
+          rcm_payment_workers: getLocal('rcm_payment_workers'),
+          rcm_payment_programs: getLocal('rcm_payment_programs'),
+          rcm_payment_roles: getLocal('rcm_payment_roles'),
+          rcm_payment_history: getLocal('rcm_payment_history')
+      };
+
+      // Scripts
+      dataToExport.scripts = {
+          rcm_scripts_programs: getLocal('rcm_scripts_programs'),
+          rcm_scripts_history: getLocal('rcm_scripts_history')
+      };
+      
+      PROGRAMS.forEach(prog => {
+          dataToExport.scripts[`guionbd_data_${prog.file}`] = getLocal(`guionbd_data_${prog.file}`);
+      });
+
+      // Program Sections
+      dataToExport.programSections = {
+          rcm_program_sections: getLocal('rcm_program_sections')
+      };
+      
+      PROGRAMS.forEach(prog => {
+          dataToExport.programSections[`program_sections_${prog.name}`] = getLocal(`program_sections_${prog.name}`);
+      });
+
+      // Agenda
+      dataToExport.agendaPrograms = getLocal('rcm_programs') || [];
+      dataToExport.agendaEfemerides = getLocal('rcm_efemerides') || {};
+      dataToExport.agendaConmemoraciones = getLocal('rcm_conmemoraciones') || {};
+      dataToExport.agendaDayThemes = getLocal('rcm_day_themes') || {};
+      dataToExport.agendaUsers = users;
+      dataToExport.agendaPropaganda = getLocal('rcm_propaganda') || {};
+      dataToExport.agendaCulturalOptions = getLocal('rcm_cultural_options') || {};
+
+      dataToExport.programsList = getLocal('rcm_programs_list') || [];
+      dataToExport.customRoots = getLocal('rcm_custom_roots') || [];
+      dataToExport.equipo = getLocal('rcm_equipo_cmnl') || [];
+      dataToExport.manualProgramming = getLocal('rcm_manual_programming') || [];
+      dataToExport.digital_signatures = getLocal('cmnl_digital_signatures');
+      
+      // Management Reports and Consolidated Payments
+      dataToExport.managementReports = getLocal('rcm_gestion_reportes') || [];
+      dataToExport.allConsolidatedPayments = getLocal('rcm_all_consolidated_payments') || [];
+
+      // User Data
+      dataToExport.userData = {
+          rcm_user_preferences: getLocal('rcm_user_preferences'),
+          rcm_user_notifications: getLocal('rcm_user_notifications')
+      };
+
+      dataToExport.radialDictionary = getLocal('rcm_diccionario_radial') || [];
+
+      // Clean up undefined values
+      Object.keys(dataToExport).forEach(key => {
+          if (dataToExport[key] === undefined) {
+              delete dataToExport[key];
+          } else if (typeof dataToExport[key] === 'object' && !Array.isArray(dataToExport[key])) {
+              Object.keys(dataToExport[key]).forEach(subKey => {
+                  if (dataToExport[key][subKey] === undefined) {
+                      delete dataToExport[key][subKey];
+                  }
+              });
+              // We do not delete the main object if it's empty, so properties like agendaCulturalOptions remain in the backup
+          }
+      });
+
+      const dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(dataToExport, null, 2));
+      const downloadAnchorNode = document.createElement('a');
+      downloadAnchorNode.setAttribute("href", dataStr);
+      downloadAnchorNode.setAttribute("download", "actualcmnl.json");
+      document.body.appendChild(downloadAnchorNode);
+      downloadAnchorNode.click();
+      downloadAnchorNode.remove();
+  };
+
+  const saveActualCMNLToServer = async () => {
+    try {
+      const dataToExport: Record<string, any> = {};
+      const getLocal = (key: string) => {
+          const val = localStorage.getItem(key);
+          if (!val) return undefined;
+          try { return JSON.parse(val); } catch (e) { return val; }
+      };
+
+      dataToExport.users = users;
+      dataToExport.historyContent = getLocal('rcm_data_history') || "";
+      dataToExport.aboutContent = getLocal('rcm_data_about') || "";
+      dataToExport.news = getLocal('rcm_data_news') || [];
+      dataToExport.fichas = getLocal('rcm_data_fichas') || [];
+      dataToExport.catalogo = getLocal('rcm_data_catalogo') || [];
+      
+      const allInterruptions: any[] = [];
+      const allWorklogs: any[] = [];
+      const allConsolidated: any[] = [];
+      const allConsolidatedMonths: any[] = [];
+      const allHabitualExclusions: any[] = [];
+      const allHabitualModes: any[] = [];
+      
+      users.forEach(user => {
+          const u = user.username;
+          const userWorklogs = getLocal(`user_${u}_rcm_data_worklogs`);
+          const userConsolidated = getLocal(`user_${u}_rcm_data_consolidated`);
+          const userInterruptions = getLocal(`user_${u}_rcm_interruptions`);
+          const userConsolidatedMonths = getLocal(`user_${u}_rcm_consolidated_months`);
+          const userHabitualExclusions = getLocal(`user_${u}_habitual_exclusions`);
+          const userHabitualMode = getLocal(`user_${u}_habitual_mode`);
+          
+          if (Array.isArray(userWorklogs)) allWorklogs.push(...userWorklogs);
+          if (Array.isArray(userConsolidated)) allConsolidated.push(...userConsolidated);
+          if (Array.isArray(userInterruptions)) allInterruptions.push(...userInterruptions);
+          if (Array.isArray(userConsolidatedMonths)) allConsolidatedMonths.push(...userConsolidatedMonths);
+          if (Array.isArray(userHabitualExclusions)) allHabitualExclusions.push({ username: u, exclusions: userHabitualExclusions });
+          if (userHabitualMode !== undefined) allHabitualModes.push({ username: u, mode: userHabitualMode });
+      });
+      
+      dataToExport.worklogs = allWorklogs;
+      dataToExport.consolidated = allConsolidated;
+      dataToExport.interruptions = allInterruptions;
+      dataToExport.consolidatedMonths = allConsolidatedMonths;
+      dataToExport.habitualExclusions = allHabitualExclusions;
+      dataToExport.habitualModes = allHabitualModes;
+      
+      dataToExport.transmissionConfig = getLocal('rcm_transmission_config');
+      dataToExport.transmissionInterruptions = getLocal('rcm_transmission_interruptions') || [];
+      dataToExport.transmissionHistorical = getLocal('rcm_transmission_historical') || [];
+      dataToExport.toolsOrder = getLocal('rcm_tools_order') || [];
+      dataToExport.whatsappGroupUrl = getLocal('rcm_whatsapp_group_url') || "";
+      dataToExport.floatingTools = getLocal('rcm_floating_tools') || [];
+      
+      dataToExport.paymentConfigs = {
+          rcm_payment_config: getLocal('rcm_payment_config'),
+          rcm_payment_workers: getLocal('rcm_payment_workers'),
+          rcm_payment_programs: getLocal('rcm_payment_programs'),
+          rcm_payment_roles: getLocal('rcm_payment_roles'),
+          rcm_payment_history: getLocal('rcm_payment_history')
+      };
+
+      dataToExport.scripts = {
+          rcm_scripts_programs: getLocal('rcm_scripts_programs'),
+          rcm_scripts_history: getLocal('rcm_scripts_history')
+      };
+      
+      PROGRAMS.forEach(prog => {
+          dataToExport.scripts[`guionbd_data_${prog.file}`] = getLocal(`guionbd_data_${prog.file}`);
+      });
+
+      dataToExport.programSections = {
+          rcm_program_sections: getLocal('rcm_program_sections')
+      };
+      
+      PROGRAMS.forEach(prog => {
+          dataToExport.programSections[`program_sections_${prog.name}`] = getLocal(`program_sections_${prog.name}`);
+      });
+
+      dataToExport.agendaPrograms = getLocal('rcm_programs') || [];
+      dataToExport.agendaEfemerides = getLocal('rcm_efemerides') || {};
+      dataToExport.agendaConmemoraciones = getLocal('rcm_conmemoraciones') || {};
+      dataToExport.agendaDayThemes = getLocal('rcm_day_themes') || {};
+      dataToExport.agendaUsers = users;
+      dataToExport.agendaPropaganda = getLocal('rcm_propaganda') || {};
+      dataToExport.agendaCulturalOptions = getLocal('rcm_cultural_options') || {};
+
+      dataToExport.programsList = getLocal('rcm_programs_list') || [];
+      dataToExport.customRoots = getLocal('rcm_custom_roots') || [];
+      dataToExport.equipo = getLocal('rcm_equipo_cmnl') || [];
+      dataToExport.manualProgramming = getLocal('rcm_manual_programming') || [];
+      dataToExport.digital_signatures = getLocal('cmnl_digital_signatures');
+      
+      dataToExport.managementReports = getLocal('rcm_gestion_reportes') || [];
+      dataToExport.allConsolidatedPayments = getLocal('rcm_all_consolidated_payments') || [];
+
+      dataToExport.userData = {
+          rcm_user_preferences: getLocal('rcm_user_preferences'),
+          rcm_user_notifications: getLocal('rcm_user_notifications')
+      };
+
+      dataToExport.radialDictionary = getLocal('rcm_diccionario_radial') || [];
+
+      Object.keys(dataToExport).forEach(key => {
+          if (dataToExport[key] === undefined) {
+              delete dataToExport[key];
+          } else if (typeof dataToExport[key] === 'object' && !Array.isArray(dataToExport[key])) {
+              Object.keys(dataToExport[key]).forEach(subKey => {
+                  if (dataToExport[key][subKey] === undefined) {
+                      delete dataToExport[key][subKey];
+                  }
+              });
+          }
+      });
+
+      await fetch('/api/save-actualcmnl', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(dataToExport)
+      });
+    } catch (e) {
+      console.error("Error saving actualcmnl.json to server:", e);
+    }
+  };
+
+  // Logic to sync from GitHub (Used by Users and Admins)
+
+  // Determine if Player should be visible
+  const isAppView = currentView.startsWith('APP_');
+  const isLoginScreen = currentView === AppView.LANDING; 
+  // Hide player on WorkerHome and AdminDashboard as it's integrated there
+  const isIntegratedPlayerView = currentView === AppView.WORKER_HOME || currentView === AppView.ADMIN_DASHBOARD;
+  const showPlayer = !isAppView && !isLoginScreen && !isIntegratedPlayerView;
+
+  const renderView = () => {
+    switch (currentView) {
+      case AppView.LANDING: // Acts as LOGIN view now
+        return <PublicLanding onNavigate={setCurrentView} users={users} onLoginSuccess={(user) => {
+            setCurrentUser(user);
+            localStorage.setItem('rcm_user_username', user.username);
+            if(user.classification === 'Administrador' || (user.role === 'admin' && user.classification !== 'Coordinador')) {
+                handleNavigate(AppView.ADMIN_DASHBOARD);
+            } else {
+                handleNavigate(AppView.WORKER_HOME);
+            }
+        }} />;
+      case AppView.LISTENER_HOME:
+        return <ListenerHome onNavigate={handleNavigate} news={news} onMenuClick={() => setIsSidebarOpen(true)} />;
+      case AppView.WORKER_HOME:
+        return (
+            <WorkerHome 
+                onNavigate={handleNavigate} 
+                news={news} 
+                currentUser={currentUser} 
+                onLogout={handleLogout}
+                isPlaying={isPlaying}
+                togglePlay={togglePlay}
+                isRefreshing={isRefreshing}
+                onRefreshLive={handleRefreshLive}
+                currentProgram={currentProgram}
+                onMenuClick={() => setIsSidebarOpen(true)}
+                onBackup={handleBackup}
+                setNews={setNewsAndSync}
+            />
+        );
+      case AppView.ADMIN_DASHBOARD:
+        return (
+          <AdminDashboard 
+            onNavigate={handleNavigate} 
+            news={news} 
+            setNews={setNewsAndSync}
+            users={users}
+            currentUser={currentUser}
+            onLogout={handleLogout}
+            isPlaying={isPlaying}
+            togglePlay={togglePlay}
+            isRefreshing={isRefreshing}
+            onRefreshLive={handleRefreshLive}
+            currentProgram={currentProgram}
+            onMenuClick={() => setIsSidebarOpen(true)}
+            onBackup={handleAdminBackup}
+          />
+        );
+      case AppView.APP_EQUIPO:
+        return (
+          <EquipoSection 
+            onBack={handleBack} 
+            onMenuClick={() => setIsSidebarOpen(true)}
+            currentUser={currentUser}
+            catalogo={JSON.parse(localStorage.getItem('rcm_data_catalogo') || '[]')}
+            onDirtyChange={setIsDirty}
+            users={users}
+            setUsers={setUsersAndSync}
+            historyContent={historyContent}
+            setHistoryContent={setHistoryContentAndSync}
+            aboutContent={aboutContent}
+            setAboutContent={setAboutContentAndSync}
+            news={news}
+            setNews={setNewsAndSync}
+            setImpersonatedUser={setImpersonatedUser}
+          />
+        );
+      
+      // CMNL Apps
+      case AppView.APP_AGENDA:
+        return <AgendaApp onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} currentUser={currentUser} users={users} onDirtyChange={setIsDirty} />;
+      case AppView.APP_MUSICA:
+        return <MusicaApp onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} currentUser={currentUser} onDirtyChange={setIsDirty} onSaveCMNL={saveActualCMNLToServer} />;
+      case AppView.APP_REPORTES:
+        return <Reports />;
+      case AppView.APP_TOOLS:
+        return <ToolsSection onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} currentUser={currentUser} equipoData={equipoData} users={users} onSaveCMNL={saveActualCMNLToServer} />;
+      case AppView.APP_GUIONES:
+        return <GuionesApp onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} currentUser={currentUser} onDirtyChange={setIsDirty} />;
+      case AppView.APP_PROGRAMACION:
+        return (
+          <GestionApp 
+            onBack={handleBack} 
+            onMenuClick={() => setIsSidebarOpen(true)} 
+            currentUser={currentUser} 
+            onDirtyChange={setIsDirty}
+            users={users}
+            setUsers={setUsersAndSync}
+            historyContent={historyContent}
+            setHistoryContent={setHistoryContentAndSync}
+            aboutContent={aboutContent}
+            setAboutContent={setAboutContentAndSync}
+            news={news}
+            setNews={setNewsAndSync}
+            setImpersonatedUser={setImpersonatedUser}
+          />
+        );
+
+      // Public Sections
+      case AppView.SECTION_HISTORY:
+        return <PlaceholderView 
+            title="Nuestra Historia" 
+            subtitle="El legado de la radio" 
+            onBack={handleBack} 
+            onMenuClick={() => setIsSidebarOpen(true)} 
+            customContent={historyContent} 
+            onUpload={currentUser?.role === 'admin' ? (e, type) => {
+                const file = e.target.files?.[0];
+                if (file) {
+                    const reader = new FileReader();
+                    reader.onload = (event) => {
+                        const text = event.target?.result as string;
+                        setHistoryContent(text);
+                        localStorage.setItem('rcm_data_history', text);
+                        alert('Historia actualizada correctamente.');
+                    };
+                    reader.readAsText(file);
+                }
+            } : undefined}
+        />;
+      case AppView.SECTION_HISTORY_EVOLUTION:
+        return <HistoryEvolutionView currentUser={currentUser} onBack={handleBack} />;
+      case AppView.SECTION_PROGRAMMING_PUBLIC:
+        return <PlaceholderView title="Parrilla de Programación" subtitle="Guía para el oyente" onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} user={currentUser} />;
+      case AppView.SECTION_ABOUT:
+        return <QuienesSomos onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} />;
+      case AppView.SECTION_NEWS:
+        return <ListenerHome onNavigate={handleNavigate} news={news} onMenuClick={() => setIsSidebarOpen(true)} />; 
+      case AppView.SECTION_NEWS_DETAIL:
+        return <PlaceholderView title="Noticias" subtitle={selectedNews?.category || "Actualidad"} onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} newsItem={selectedNews} user={currentUser} onNewsUpdate={(updatedNews) => {
+            const updatedNewsList = news.map(n => n.id === updatedNews.id ? updatedNews : n);
+            setNews(updatedNewsList);
+            localStorage.setItem('rcm_data_news', JSON.stringify(updatedNewsList));
+            setSelectedNews(updatedNews);
+        }} />;
+      case AppView.SECTION_PODCAST:
+        return <PlaceholderView title="Podcasts" subtitle="Escucha a tu ritmo" onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} />;
+      case AppView.SECTION_PROFILE:
+        return <PlaceholderView title="Mi Perfil" subtitle="Configuración de usuario" onBack={handleBack} onMenuClick={() => setIsSidebarOpen(true)} />;
+        
+      default:
+        return <ListenerHome onNavigate={handleNavigate} news={news} onMenuClick={() => setIsSidebarOpen(true)} />;
+    }
+  };
+
+  return (
+      <div className="w-full min-h-screen bg-[#1A100C] font-display">
+        <audio 
+          ref={audioRef} 
+          src="https://icecast.teveo.cu/KR43FF7C" 
+          preload="none"
+          onPlay={() => setIsPlaying(true)}
+          onPause={() => setIsPlaying(false)}
+        ></audio>
+
+        <Sidebar 
+          isOpen={isSidebarOpen} 
+          onClose={() => setIsSidebarOpen(false)} 
+          onNavigate={handleNavigate}
+          currentUser={impersonatedUser || currentUser}
+          onLogout={handleLogout}
+          onLogin={() => setCurrentView(AppView.LANDING)}
+        />
+        
+        <InstallPWA />
+        
+        {renderView()}
+
+        <BackupDialog 
+          isOpen={showBackupDialog} 
+          onClose={() => {
+              setShowBackupDialog(false);
+              if (pendingNavigation.current) {
+                  pendingNavigation.current();
+                  pendingNavigation.current = null;
+              }
+          }}
+          onBackup={handleBackup}
+          onSnooze={(hours) => {
+              if (currentUser) {
+                  const snoozeUntil = Date.now() + hours * 60 * 60 * 1000;
+                  localStorage.setItem(`backup_snoozed_until_${currentUser.username}`, snoozeUntil.toString());
+              }
+              setShowBackupDialog(false);
+              if (pendingNavigation.current) {
+                  pendingNavigation.current();
+                  pendingNavigation.current = null;
+              }
+          }}
+          isLogoutTrigger={isLogoutTrigger}
+        />
+
+        {sabiasEstoTerm && (
+          <div className="fixed inset-0 bg-black/70 backdrop-blur-md z-[550] flex items-center justify-center p-4">
+            <div 
+              className="bg-[#2D1B13] border border-amber-500/30 rounded-2xl p-8 max-w-lg w-full shadow-2xl relative animate-in zoom-in-95 duration-200 flex flex-col gap-4 text-center"
+              onClick={(e) => e.stopPropagation()}
+            >
+              <button 
+                onClick={() => {
+                  setSabiasEstoTerm(null);
+                  localStorage.setItem('rcm_sabias_esto_last_show', Date.now().toString());
+                }}
+                className="absolute top-4 right-4 text-stone-400 hover:text-white transition-all p-1 hover:bg-white/5 rounded-full"
+                title="Cerrar"
+              >
+                <X size={20} />
+              </button>
+
+              <div className="mx-auto w-14 h-14 rounded-full bg-amber-500/10 flex items-center justify-center border border-amber-500/20 text-amber-500 mb-2">
+                <BookOpen size={28} className="animate-pulse" />
+              </div>
+
+              <h3 className="text-2xl font-extrabold text-[#F5EFE6] tracking-tight">
+                ¿Sabías esto?
+              </h3>
+
+              <div className="bg-black/30 border border-stone-800/80 rounded-xl p-5 text-left text-sm font-mono leading-relaxed text-stone-200">
+                <p>
+                  {(() => {
+                    const term = sabiasEstoTerm.term;
+                    const definition = sabiasEstoTerm.definition;
+                    const firstChar = definition.charAt(0);
+                    const rest = definition.slice(1);
+                    const isAcronym = /^[A-Z]{2,}/.test(definition);
+                    const lowercaseFirst = isAcronym ? firstChar : firstChar.toLowerCase();
+                    return (
+                      <>
+                        El término <span className="text-amber-400 font-bold font-sans capitalize">{term}</span> hace referencia a {lowercaseFirst}{rest}
+                      </>
+                    );
+                  })()}
+                </p>
+              </div>
+
+              <button
+                onClick={() => {
+                  setSabiasEstoTerm(null);
+                  localStorage.setItem('rcm_sabias_esto_last_show', Date.now().toString());
+                }}
+                className="mt-2 w-full py-3 bg-amber-600 hover:bg-amber-500 text-white font-mono text-xs font-bold uppercase rounded-xl transition-all shadow-lg shadow-amber-900/20"
+              >
+                Entendido
+              </button>
+            </div>
+          </div>
+        )}
+
+        {confirmAction && (
+            <div className="fixed inset-0 bg-black/60 backdrop-blur-md z-[500] flex items-center justify-center p-4 animate-in fade-in duration-200">
+                <div className="bg-[#2C1B15] border border-[#9E7649]/30 rounded-2xl p-6 max-w-sm w-full shadow-2xl animate-in zoom-in-95 duration-200">
+                    <h3 className="text-[#C69C6D] font-serif font-bold text-xl mb-2">{confirmAction.title}</h3>
+                    <p className="text-stone-300 text-sm mb-6 leading-relaxed">{confirmAction.message}</p>
+                    <div className="flex gap-3">
+                        <button 
+                            onClick={() => setConfirmAction(null)}
+                            className="flex-1 px-4 py-2 rounded-xl border border-white/10 text-stone-400 font-bold text-sm hover:bg-white/5 transition-colors"
+                        >
+                            Cancelar
+                        </button>
+                        <button 
+                            onClick={confirmAction.onConfirm}
+                            className="flex-1 px-4 py-2 rounded-xl bg-[#9E7649] text-white font-bold text-sm hover:bg-[#8B653D] shadow-lg shadow-[#9E7649]/20 transition-all active:scale-95"
+                        >
+                            Confirmar
+                        </button>
+                    </div>
+                </div>
+            </div>
+        )}
+
+        <UpdateDetailsModal 
+            isOpen={updateDetails?.show || false}
+            details={updateDetails?.content || ""}
+            isAdmin={currentUser?.role === 'admin'}
+            onClose={() => {
+                setUpdateDetails(null);
+                
+                // Consolidar la actualización de la app (Service Worker y Caché)
+                if ('serviceWorker' in navigator) {
+                    navigator.serviceWorker.getRegistrations().then((registrations) => {
+                        for (let registration of registrations) {
+                            registration.update();
+                        }
+                    });
+                }
+                if ('caches' in window) {
+                    caches.keys().then((names) => {
+                        for (let name of names) {
+                            caches.delete(name);
+                        }
+                    });
+                }
+                
+                setTimeout(() => window.location.reload(), 150);
+            }}
+        />
+
+        
+
+        {showPlayer && (
+           <>
+             <div className={`fixed bottom-0 left-0 right-0 z-[100] bg-[#3E1E16]/95 backdrop-blur-xl border-t border-[#9E7649]/20 transition-all duration-300 flex`}>
+                 
+                 {/* Left Info Box (Only on Desktop Listener Home) */}
+                 {(currentView === AppView.LISTENER_HOME || currentView === AppView.SECTION_NEWS) && (
+                    <div className="hidden md:flex flex-col justify-center w-64 bg-[#2C1B15] border-r border-white/5 px-6 shrink-0 py-3">
+                        <p className="font-bold text-[#C69C6D] uppercase tracking-widest text-[10px] mb-1">Radio Ciudad Monumento</p>
+                        <p className="text-[10px] text-stone-500">Voz de la segunda villa cubana</p>
+                        <p className="text-[10px] text-stone-500 opacity-50 mt-1">CMNL App 2026</p>
+                    </div>
+                 )}
+
+                 {/* Live Player Content */}
+                 <div className="flex-1 px-4 py-3 relative" style={{ paddingBottom: 'calc(0.75rem + var(--sab))' }}>
+                     <div className="max-w-md mx-auto flex items-center gap-3">
+                         {/* Refresh Button replacing previous Image */}
+                         <button 
+                            onClick={handleRefreshLive}
+                            className="w-10 h-10 rounded-lg bg-white/5 border border-[#9E7649]/20 flex items-center justify-center shrink-0 text-[#9E7649] hover:bg-[#9E7649]/10 active:scale-95 transition-all"
+                            title="Actualizar transmisión"
+                         >
+                             <RefreshCw size={20} className={isRefreshing ? 'animate-spin' : ''} />
+                         </button>
+
+                         <div className="flex-1 min-w-0">
+                            <p className="text-[#F5EFE6] text-sm font-bold truncate">{currentProgram.name}</p>
+                            <div className="flex items-center gap-1.5">
+                                <span className="w-1.5 h-1.5 rounded-full bg-red-500 animate-pulse"></span>
+                                <p className="text-[#9E7649] text-[10px] truncate">95.3 FM • Señal en vivo</p>
+                            </div>
+                         </div>
+                         <div className="flex items-center gap-3">
+                            <button className="text-[#E8DCCF]/60 hover:text-[#9E7649] transition-colors"><SkipBack size={20} fill="currentColor" className="opacity-50" /></button>
+                            <button 
+                              onClick={togglePlay}
+                              className="w-10 h-10 rounded-full bg-[#9E7649] text-[#3E1E16] flex items-center justify-center shadow-lg hover:scale-105 transition-all border border-white/10"
+                            >
+                               {isPlaying ? <Pause size={20} fill="currentColor" /> : <Play size={20} fill="currentColor" className="ml-0.5" />}
+                            </button>
+                            <button className="text-[#E8DCCF]/60 hover:text-[#9E7649] transition-colors"><SkipForward size={20} fill="currentColor" className="opacity-50" /></button>
+                         </div>
+                     </div>
+                     <div className="absolute top-0 left-0 right-0 h-4 flex items-end justify-center gap-[1px] px-1 overflow-hidden pointer-events-none">
+                        {isPlaying ? (
+                            Array.from({ length: 100 }).map((_, i) => (
+                                <motion.div
+                                    key={i}
+                                    className="w-[2px] bg-[#9E7649]/40"
+                                    animate={{
+                                        height: [2, Math.random() * 16 + 2, 2],
+                                    }}
+                                    transition={{
+                                        duration: 0.4 + Math.random() * 0.6,
+                                        repeat: Infinity,
+                                        ease: "easeInOut",
+                                        delay: i * 0.01
+                                    }}
+                                />
+                            ))
+                        ) : (
+                            <div className="w-full h-[1px] bg-[#9E7649]/10" />
+                        )}
+                     </div>
+                 </div>
+             </div>
+             <style>{`
+                @keyframes progress-indeterminate {
+                    0% { left: -30%; width: 30%; }
+                    50% { left: 40%; width: 40%; }
+                    100% { left: 100%; width: 30%; }
+                }
+                .animate-progress-indeterminate {
+                    animation: progress-indeterminate 2s infinite linear;
+                }
+             `}</style>
+           </>
+        )}
+      </div>
+  );
+};
+
+export default App;
