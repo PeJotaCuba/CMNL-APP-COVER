@@ -334,28 +334,31 @@ const MusicaApp: React.FC<MusicaAppProps> = ({ currentUser: globalUser, onBack, 
               
               // If small enough, we could still send it directly, but for consistency let's use storage if > 500KB
               if (blob.size > 500 * 1024) {
-                  const postUrl = await generateUploadUrl();
-                  const result = await fetch(postUrl, {
-                      method: "POST",
-                      headers: { "Content-Type": "application/json" },
-                      body: blob,
-                  });
-                  const { storageId } = await result.json();
-                  
-                  // We need a way to get the URL. In Convex, we can use a query.
-                  // For now, let's just use a placeholder and we'll fix the stationData mutation 
-                  // to optionally resolve storage URLs if we really need to.
-                  // Actually, I'll add a mutation to get the URL.
-                  
-                  await updateStationDataMutation({
-                      key: 'music_tracks',
-                      data: sanitizeKeys({
-                          storageId: storageId,
-                          // We will resolve this in the query side or provide a helper
-                          url: `${window.location.origin}/api/storage/${storageId}` // Placeholder
-                      }),
-                      updatedBy: globalUser?.username || 'admin'
-                  });
+                  try {
+                      const postUrl = await generateUploadUrl();
+                      const result = await fetch(postUrl, {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: blob,
+                      });
+                      const { storageId } = await result.json();
+                      
+                      await updateStationDataMutation({
+                          key: 'music_tracks',
+                          data: sanitizeKeys({
+                              storageId: storageId,
+                              url: `${window.location.origin}/api/storage/${storageId}`
+                          }),
+                          updatedBy: globalUser?.username || 'admin'
+                      });
+                  } catch (err) {
+                      console.warn("Convex storage upload failed or not available, falling back to direct stationData:", err);
+                      await updateStationDataMutation({
+                          key: 'music_tracks',
+                          data: sanitizeKeys(finalTracks),
+                          updatedBy: globalUser?.username || 'admin'
+                      });
+                  }
               } else {
                   await updateStationDataMutation({
                       key: 'music_tracks',

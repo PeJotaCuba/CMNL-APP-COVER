@@ -261,7 +261,7 @@ const Editorial: React.FC<EditorialProps> = ({
           });
 
       } catch (err) {
-          console.error("Error syncing generated PDF to Convex:", err);
+          console.warn("Convex document storage optional upload not available or failed:", err);
       }
 
       setAlertDialog({ message: "Agenda generada y guardada con éxito. Se ha sincronizado para todos los usuarios." });

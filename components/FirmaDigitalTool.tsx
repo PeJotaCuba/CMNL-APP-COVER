@@ -151,22 +151,30 @@ export const FirmaDigitalTool = ({ user, isAdmin, onUpdateDatabase, equipoData =
     documentType?: string;
     metadata?: any;
   }) => {
-    await submitDocMutation({
-      title: docData.title,
-      contentUrl: docData.contentUrl,
-      sender: docData.sender,
-      senderName: docData.senderName || docData.sender,
-      documentType: docData.documentType || 'general',
-      metadata: docData.metadata || {}
-    });
+    try {
+      await submitDocMutation({
+        title: docData.title,
+        contentUrl: docData.contentUrl,
+        sender: docData.sender,
+        senderName: docData.senderName || docData.sender,
+        documentType: docData.documentType || 'general',
+        metadata: docData.metadata || {}
+      });
+    } catch (err) {
+      console.warn("Convex submitDocument unavailable or failed:", err);
+    }
   };
 
   // Convex-backed updateDocumentStatus
   const updateDocumentStatus = async (updateData: { id: string; status: string }) => {
-    await updateDocStatusMutation({
-      id: updateData.id as any,
-      status: updateData.status
-    });
+    try {
+      await updateDocStatusMutation({
+        id: updateData.id as any,
+        status: updateData.status
+      });
+    } catch (err) {
+      console.warn("Convex updateDocumentStatus unavailable or failed:", err);
+    }
   };
 
   const handleSendSemanalToConvex = async () => {
