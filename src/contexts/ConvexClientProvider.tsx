@@ -1,18 +1,14 @@
 import React from 'react';
 import { ConvexReactClient, ConvexProvider } from 'convex/react';
 
-const CONVEX_URL = import.meta.env.VITE_CONVEX_URL;
-export const convexClient = CONVEX_URL ? new ConvexReactClient(CONVEX_URL) : null;
+const CONVEX_URL = import.meta.env.VITE_CONVEX_URL || (typeof window !== 'undefined' ? `${window.location.origin}/api/convex` : 'https://placeholder.convex.cloud');
+export const convexClient = new ConvexReactClient(CONVEX_URL);
 
 interface ConvexClientProviderProps {
   children: React.ReactNode;
 }
 
 export const ConvexClientProvider: React.FC<ConvexClientProviderProps> = ({ children }) => {
-  if (!convexClient) {
-    return <>{children}</>;
-  }
-
   return (
     <ConvexProvider client={convexClient}>
       {children}
