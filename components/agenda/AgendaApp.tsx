@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
-import { useQuery } from 'convex/react';
+import { useSafeQuery } from '../../src/utils/convexUtils';
 import { api } from '../../convex/_generated/api';
 import { desanitizeKeys } from '../../utils/convexSanitizer';
 import { HashRouter as Router, Routes, Route, Navigate, useNavigate } from 'react-router-dom';
@@ -116,7 +116,7 @@ const InnerAgendaApp: React.FC<{
 };
 
 const AgendaApp: React.FC<Props> = ({ onBack, onMenuClick, currentUser, users: mainUsers, onDirtyChange }) => {
-  const allConvexStationData = useQuery(api.stationData.getAllStationData);
+  const allConvexStationData = useSafeQuery(api.stationData.getAllStationData);
 
   const [users, setUsers] = useState<UserProfile[]>(() => {
     try {
@@ -257,7 +257,7 @@ const AgendaApp: React.FC<Props> = ({ onBack, onMenuClick, currentUser, users: m
       } else if (currentUser.classification === 'Coordinador' && (currentUser.coordinatorSections || []).includes('Agenda')) {
          agendaRole = UserRole.ADMIN;
       }
-      setUser({
+      const nextUser = {
         id: userId,
         name: currentUser.name,
         username: currentUser.username,
@@ -270,7 +270,8 @@ const AgendaApp: React.FC<Props> = ({ onBack, onMenuClick, currentUser, users: m
         specialty: currentUser.specialty,
         coordinatorSections: currentUser.coordinatorSections,
         interests: savedUser?.interests || { days: [], programIds: [] }
-      });
+      };
+      setUser(prev => JSON.stringify(prev) === JSON.stringify(nextUser) ? prev : nextUser);
     } else {
       setUser(null);
     }
@@ -639,51 +640,37 @@ const AgendaApp: React.FC<Props> = ({ onBack, onMenuClick, currentUser, users: m
 
     const remotePrograms = getRemoteData('rcm_programs');
     if (remotePrograms && Array.isArray(remotePrograms)) {
-        if (JSON.stringify(remotePrograms) !== JSON.stringify(programs)) {
-            setPrograms(remotePrograms);
-        }
+        setPrograms(prev => JSON.stringify(prev) === JSON.stringify(remotePrograms) ? prev : remotePrograms);
     }
 
     const remoteEfemerides = getRemoteData('rcm_efemerides');
     if (remoteEfemerides && typeof remoteEfemerides === 'object') {
-        if (JSON.stringify(remoteEfemerides) !== JSON.stringify(efemerides)) {
-            setEfemerides(remoteEfemerides);
-        }
+        setEfemerides(prev => JSON.stringify(prev) === JSON.stringify(remoteEfemerides) ? prev : remoteEfemerides);
     }
 
     const remoteConmemoraciones = getRemoteData('rcm_conmemoraciones');
     if (remoteConmemoraciones && typeof remoteConmemoraciones === 'object') {
-        if (JSON.stringify(remoteConmemoraciones) !== JSON.stringify(conmemoraciones)) {
-            setConmemoraciones(remoteConmemoraciones);
-        }
+        setConmemoraciones(prev => JSON.stringify(prev) === JSON.stringify(remoteConmemoraciones) ? prev : remoteConmemoraciones);
     }
 
     const remoteDayThemes = getRemoteData('rcm_day_themes');
     if (remoteDayThemes && typeof remoteDayThemes === 'object') {
-        if (JSON.stringify(remoteDayThemes) !== JSON.stringify(dayThemes)) {
-            setDayThemes(remoteDayThemes);
-        }
+        setDayThemes(prev => JSON.stringify(prev) === JSON.stringify(remoteDayThemes) ? prev : remoteDayThemes);
     }
 
     const remotePropaganda = getRemoteData('rcm_propaganda');
     if (remotePropaganda && typeof remotePropaganda === 'object') {
-        if (JSON.stringify(remotePropaganda) !== JSON.stringify(propaganda)) {
-            setPropaganda(remotePropaganda);
-        }
+        setPropaganda(prev => JSON.stringify(prev) === JSON.stringify(remotePropaganda) ? prev : remotePropaganda);
     }
 
     const remoteCulturalOptions = getRemoteData('rcm_cultural_options');
     if (remoteCulturalOptions && typeof remoteCulturalOptions === 'object') {
-        if (JSON.stringify(remoteCulturalOptions) !== JSON.stringify(culturalOptions)) {
-            setCulturalOptions(remoteCulturalOptions);
-        }
+        setCulturalOptions(prev => JSON.stringify(prev) === JSON.stringify(remoteCulturalOptions) ? prev : remoteCulturalOptions);
     }
 
     const remoteUsers = getRemoteData('rcm_users');
     if (remoteUsers && Array.isArray(remoteUsers)) {
-        if (JSON.stringify(remoteUsers) !== JSON.stringify(users)) {
-            setUsers(remoteUsers);
-        }
+        setUsers(prev => JSON.stringify(prev) === JSON.stringify(remoteUsers) ? prev : remoteUsers);
     }
   }, [allConvexStationData]);
 
@@ -712,28 +699,32 @@ const AgendaApp: React.FC<Props> = ({ onBack, onMenuClick, currentUser, users: m
   }, []);
 
   useEffect(() => {
-    localStorage.setItem('rcm_programs', JSON.stringify(programs));
-    localStorage.setItem('rcm_efemerides', JSON.stringify(efemerides));
-    localStorage.setItem('rcm_conmemoraciones', JSON.stringify(conmemoraciones));
-    localStorage.setItem('rcm_day_themes', JSON.stringify(dayThemes));
-    localStorage.setItem('rcm_propaganda', JSON.stringify(propaganda));
-    localStorage.setItem('rcm_cultural_options', JSON.stringify(culturalOptions));
-    localStorage.setItem('rcm_users', JSON.stringify(users));
-    
-    // Check if any data is different from initial to avoid marking dirty on first load
-    // Actually, a simpler way is to just call it if any of these change after mount
+    const saveIfChanged = (key: string, val: any) => {
+      const str = JSON.stringify(val);
+      if (localStorage.getItem(key) !== str) {
+        localStorage.setItem(key, str);
+      }
+    };
+    saveIfChanged('rcm_programs', programs);
+    saveIfChanged('rcm_efemerides', efemerides);
+    saveIfChanged('rcm_conmemoraciones', conmemoraciones);
+    saveIfChanged('rcm_day_themes', dayThemes);
+    saveIfChanged('rcm_propaganda', propaganda);
+    saveIfChanged('rcm_cultural_options', culturalOptions);
+    saveIfChanged('rcm_users', users);
   }, [programs, efemerides, conmemoraciones, dayThemes, propaganda, culturalOptions, users]);
 
   useEffect(() => {
     const handleRemoteSync = (e: any) => {
       const { key, data } = e.detail;
-      if (key === 'rcm_programs') setPrograms(data);
-      else if (key === 'rcm_efemerides') setEfemerides(data);
-      else if (key === 'rcm_conmemoraciones') setConmemoraciones(data);
-      else if (key === 'rcm_day_themes') setDayThemes(data);
-      else if (key === 'rcm_propaganda') setPropaganda(data);
-      else if (key === 'rcm_cultural_options') setCulturalOptions(data);
-      else if (key === 'rcm_users') setUsers(data);
+      const stringifiedData = typeof data === 'string' ? data : JSON.stringify(data);
+      if (key === 'rcm_programs') setPrograms(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
+      else if (key === 'rcm_efemerides') setEfemerides(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
+      else if (key === 'rcm_conmemoraciones') setConmemoraciones(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
+      else if (key === 'rcm_day_themes') setDayThemes(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
+      else if (key === 'rcm_propaganda') setPropaganda(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
+      else if (key === 'rcm_cultural_options') setCulturalOptions(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
+      else if (key === 'rcm_users') setUsers(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
     };
 
     window.addEventListener('cmnl_db_sync', handleRemoteSync);

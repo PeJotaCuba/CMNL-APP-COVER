@@ -25,7 +25,8 @@ import { RADIAL_TERMS_BASE } from './components/radialTermsBase';
 import { motion, AnimatePresence } from 'motion/react';
 
 import { ConvexClientProvider } from './src/contexts/ConvexClientProvider';
-import { useQuery, useMutation } from 'convex/react';
+import { useMutation } from 'convex/react';
+import { useSafeQuery } from './src/utils/convexUtils';
 import { api } from './convex/_generated/api';
 import { sanitizeKeys, desanitizeKeys } from './utils/convexSanitizer';
 
@@ -258,7 +259,7 @@ const AppContent: React.FC = () => {
   const [selectedNews, setSelectedNews] = useState<NewsItem | null>(null);
   
   // Convex Real-Time Synchronization Engine
-  const allConvexStationData = useQuery(api.stationData.getAllStationData);
+  const allConvexStationData = useSafeQuery(api.stationData.getAllStationData);
   const updateStationDataMutation = useMutation(api.stationData.updateStationData);
 
   // Wrapped State Setters to ensure any local setter call automatically updates localStorage
@@ -295,6 +296,8 @@ const AppContent: React.FC = () => {
   };
 
   // Intercept all manual localStorage.setItem calls and sync to Convex & BroadcastChannel in real-time
+  const isRemoteSyncingRef = useRef(false);
+
   useEffect(() => {
     const originalSetItem = localStorage.setItem;
     let syncChannel: BroadcastChannel | null = null;
@@ -305,8 +308,15 @@ const AppContent: React.FC = () => {
     }
     
     localStorage.setItem = function(key, value) {
-      originalSetItem.apply(this, [key, value]);
+      const prevVal = localStorage.getItem(key);
       
+      // Stop recursion or unnecessary work if value hasn't changed
+      if (prevVal === value) {
+        return;
+      }
+
+      originalSetItem.apply(this, [key, value]);
+
       const syncKeys = [
         'rcm_data_users', 'rcm_data_news', 'rcm_data_history', 'rcm_data_about',
         'rcm_data_fichas', 'rcm_data_catalogo', 'rcm_equipo_cmnl', 'rcm_programs',
@@ -338,14 +348,16 @@ const AppContent: React.FC = () => {
         // Fire local event
         window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data: parsedVal } }));
 
-        // Sync to Convex
-        updateStationDataMutation({
-          key: key,
-          data: cleanVal,
-          updatedBy: localStorage.getItem('rcm_user_username') || 'system'
-        }).catch(err => {
-          console.error("Failed to sync key to Convex:", key, err);
-        });
+        // Sync to Convex (only if NOT triggered by incoming remote Convex update)
+        if (!isRemoteSyncingRef.current) {
+          updateStationDataMutation({
+            key: key,
+            data: cleanVal,
+            updatedBy: localStorage.getItem('rcm_user_username') || 'system'
+          }).catch(err => {
+            console.error("Failed to sync key to Convex:", key, err);
+          });
+        }
       }
     };
 
@@ -353,16 +365,17 @@ const AppContent: React.FC = () => {
     if (syncChannel) {
       syncChannel.onmessage = (event) => {
         const { key, data } = event.data || {};
+        const stringifiedData = typeof data === 'string' ? data : JSON.stringify(data);
         if (key === 'rcm_data_news') {
-          setNews(data);
+          setNews(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
         } else if (key === 'rcm_data_history') {
-          setHistoryContent(data);
+          setHistoryContent(prev => prev === data ? prev : data);
         } else if (key === 'rcm_data_about') {
-          setAboutContent(data);
+          setAboutContent(prev => prev === data ? prev : data);
         } else if (key === 'rcm_data_users') {
-          setUsers(data);
+          setUsers(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
         } else if (key === 'rcm_equipo_cmnl') {
-          setEquipoData(data);
+          setEquipoData(prev => JSON.stringify(prev) === stringifiedData ? prev : data);
         }
         window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data } }));
       };
@@ -378,30 +391,35 @@ const AppContent: React.FC = () => {
   useEffect(() => {
     if (!allConvexStationData) return;
     
-    allConvexStationData.forEach(item => {
-      const { key, data } = item;
-      const desanitizedData = desanitizeKeys(data);
-      const localValue = localStorage.getItem(key);
-      const stringifiedRemote = JSON.stringify(desanitizedData);
-      
-      if (localValue !== stringifiedRemote) {
-        localStorage.setItem(key, stringifiedRemote);
+    isRemoteSyncingRef.current = true;
+    try {
+      allConvexStationData.forEach(item => {
+        const { key, data } = item;
+        const desanitizedData = desanitizeKeys(data);
+        const localValue = localStorage.getItem(key);
+        const stringifiedRemote = typeof desanitizedData === 'string' ? desanitizedData : JSON.stringify(desanitizedData);
         
-        if (key === 'rcm_data_users') {
-          setUsers(desanitizedData);
-        } else if (key === 'rcm_data_news') {
-          setNews(desanitizedData);
-        } else if (key === 'rcm_data_history') {
-          setHistoryContent(desanitizedData);
-        } else if (key === 'rcm_data_about') {
-          setAboutContent(desanitizedData);
-        } else if (key === 'rcm_equipo_cmnl') {
-          setEquipoData(desanitizedData);
+        if (localValue !== stringifiedRemote) {
+          localStorage.setItem(key, stringifiedRemote);
+          
+          if (key === 'rcm_data_users') {
+            setUsers(prev => JSON.stringify(prev) === stringifiedRemote ? prev : desanitizedData);
+          } else if (key === 'rcm_data_news') {
+            setNews(prev => JSON.stringify(prev) === stringifiedRemote ? prev : desanitizedData);
+          } else if (key === 'rcm_data_history') {
+            setHistoryContent(prev => prev === desanitizedData ? prev : desanitizedData);
+          } else if (key === 'rcm_data_about') {
+            setAboutContent(prev => prev === desanitizedData ? prev : desanitizedData);
+          } else if (key === 'rcm_equipo_cmnl') {
+            setEquipoData(prev => JSON.stringify(prev) === stringifiedRemote ? prev : desanitizedData);
+          }
+          
+          window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data: desanitizedData } }));
         }
-        
-        window.dispatchEvent(new CustomEvent('cmnl_db_sync', { detail: { key, data: desanitizedData } }));
-      }
-    });
+      });
+    } finally {
+      isRemoteSyncingRef.current = false;
+    }
   }, [allConvexStationData]);
 
   // Auth State
@@ -517,12 +535,34 @@ const AppContent: React.FC = () => {
   }, [currentUser]);
 
   // Persistence Effects
-  useEffect(() => { localStorage.setItem('rcm_data_users', JSON.stringify(users)); }, [users]);
-  useEffect(() => { localStorage.setItem('rcm_data_news', JSON.stringify(news)); }, [news]);
-  useEffect(() => { localStorage.setItem('rcm_data_history', historyContent); }, [historyContent]);
-  useEffect(() => { localStorage.setItem('rcm_data_about', aboutContent); }, [aboutContent]);
+  useEffect(() => { 
+    const str = JSON.stringify(users);
+    if (localStorage.getItem('rcm_data_users') !== str) {
+      localStorage.setItem('rcm_data_users', str); 
+    }
+  }, [users]);
+
+  useEffect(() => { 
+    const str = JSON.stringify(news);
+    if (localStorage.getItem('rcm_data_news') !== str) {
+      localStorage.setItem('rcm_data_news', str); 
+    }
+  }, [news]);
+
+  useEffect(() => { 
+    if (localStorage.getItem('rcm_data_history') !== historyContent) {
+      localStorage.setItem('rcm_data_history', historyContent); 
+    }
+  }, [historyContent]);
+
+  useEffect(() => { 
+    if (localStorage.getItem('rcm_data_about') !== aboutContent) {
+      localStorage.setItem('rcm_data_about', aboutContent); 
+    }
+  }, [aboutContent]);
+
   useEffect(() => {
-    if (currentView) {
+    if (currentView && localStorage.getItem('rcm_current_view') !== currentView) {
       localStorage.setItem('rcm_current_view', currentView);
     }
   }, [currentView]);

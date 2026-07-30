@@ -6,7 +6,8 @@ import { openWhatsApp } from '../../utils/whatsappUtils';
 import { generateReportPDF } from './services/pdfService';
 import { getStoredPassword, getStoredCertificate, generateDigitalSignature, checkSigningAuthorization } from '../../utils/signatureUtils';
 import BatchSigner from './BatchSigner';
-import { useQuery, useMutation } from 'convex/react';
+import { useMutation } from 'convex/react';
+import { useSafeQuery } from '../../src/utils/convexUtils';
 import { api } from '../../convex/_generated/api';
 import { sanitizeKeys, desanitizeKeys } from '../../utils/convexSanitizer';
 
@@ -18,7 +19,7 @@ interface ReportsViewerProps {
 }
 
 const ReportsViewer: React.FC<ReportsViewerProps> = ({ users = [], onEdit, currentUser, refreshTrigger = 0 }) => {
-    const allConvexStationData = useQuery(api.stationData.getAllStationData);
+    const allConvexStationData = useSafeQuery(api.stationData.getAllStationData);
     const updateStationData = useMutation(api.stationData.updateStationData);
 
     const [reports, setReports] = useState<Report[]>([]);

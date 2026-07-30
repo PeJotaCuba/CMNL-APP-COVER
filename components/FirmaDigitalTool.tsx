@@ -6,7 +6,8 @@ import jsPDF from 'jspdf';
 import { openWhatsApp } from '../utils/whatsappUtils';
 import { DeviceIdentityService } from '../src/services/DeviceIdentityService';
 import { isDeviceLimitEnabledForUser, getAuthorizedDevicesForUser } from '../utils/authorizedDevicesCode';
-import { useQuery, useMutation } from 'convex/react';
+import { useMutation } from 'convex/react';
+import { useSafeQuery } from '../src/utils/convexUtils';
 import { api } from '../convex/_generated/api';
 
 
@@ -132,7 +133,7 @@ export const FirmaDigitalTool = ({ user, isAdmin, onUpdateDatabase, equipoData =
   const [isUploadingToConvex, setIsUploadingToConvex] = useState(false);
 
   // Subscribe to real-time documents from Convex
-  const convexDocs = useQuery(api.documents.getDocumentsList, {
+  const convexDocs = useSafeQuery(api.documents.getDocumentsList, {
     sender: isAdmin ? undefined : (user?.username || 'unknown')
   });
 

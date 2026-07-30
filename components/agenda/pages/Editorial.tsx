@@ -10,7 +10,8 @@ import autoTable from 'jspdf-autotable';
 import * as XLSX from 'xlsx-js-style';
 import AgendaHeader from '../components/AgendaHeader';
 import { saveAgendaPdf, loadAgendaPdfs, deleteAgendaPdf, deleteAllAgendaPdfs, GeneratedAgenda } from '../services/db';
-import { useQuery, useMutation } from 'convex/react';
+import { useMutation } from 'convex/react';
+import { useSafeQuery } from '../../../src/utils/convexUtils';
 import { api } from '../../../convex/_generated/api';
 import { sanitizeKeys, desanitizeKeys } from '../../../utils/convexSanitizer';
 
@@ -128,12 +129,12 @@ const Editorial: React.FC<EditorialProps> = ({
   user, users, programs, dayThemes, efemerides, conmemoraciones, onUpdateProgram, onUpdateMany, onUpdateDayThemes, onClearAll, filterEnabled, onMenuClick, onBack
 }) => {
   const navigate = useNavigate();
-  const allConvexStationData = useQuery(api.stationData.getAllStationData);
+  const allConvexStationData = useSafeQuery(api.stationData.getAllStationData);
   const updateStationData = useMutation(api.stationData.updateStationData);
   
   const generateUploadUrl = useMutation(api.documents.generateUploadUrl);
   const submitDocument = useMutation(api.documents.submitDocument);
-  const allAgendaPdfs = useQuery(api.documents.getDocumentsList, { documentType: 'agenda_pdf' });
+  const allAgendaPdfs = useSafeQuery(api.documents.getDocumentsList, { documentType: 'agenda_pdf' });
 
   const dateInfo = getCurrentDateInfo(); 
   
